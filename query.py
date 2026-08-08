@@ -40,10 +40,16 @@ def contextualize(query, history):
         model=HAIKU,
         max_tokens=200,
         messages=[{"role": "user", "content":
-            f"""Given the conversation below, rewrite the follow-up question into a
-standalone question that names the specific topic (resolve words like "it", "this",
-"they"). If the question is already standalone, return it unchanged.
-Return ONLY the rewritten question, nothing else.
+            f"""You rewrite follow-up questions into standalone questions for a search system.
+
+Rules:
+- If the question refers back to the previous topic (uses "it", "this", "they", "that",
+  or is clearly continuing the same subject), rewrite it into a standalone question that
+  names the specific topic.
+- If the question is already standalone, return it unchanged.
+- If the question introduces a NEW, UNRELATED topic (even if short or vague), return it
+  UNCHANGED. Do NOT attach the previous topic to a new question.
+Return ONLY the resulting question, nothing else.
 
 Conversation:
 {recent}
@@ -70,7 +76,9 @@ FALLBACK_SYSTEM = (
     f"obstetrics). In that case respond with EXACTLY this token and nothing else: "
     f"{OUT_OF_SCOPE_MARKER}\n"
     "When you answer, be accurate and concise, focus on the ENT angle, do NOT "
-    "fabricate citations or page numbers, and say so if you are uncertain."
+    "fabricate citations or page numbers, and say so if you are uncertain.\n"
+    "Do NOT use markdown tables or pipe characters (they don't render in Telegram); "
+    "present any tabular data as a readable indented list grouped by category."
 )
 
 
@@ -89,10 +97,13 @@ def sonnet_fallback(question):
     body = extract_text(msg)
 
     if OUT_OF_SCOPE_MARKER in body:
-        return ("This question is outside my otorhinolaryngology scope.")
+        return ("This question is outside my scope. I'm an ENT (ear, nose, throat, "
+                "head & neck) reference assistant and can't help with topics outside "
+                "otorhinolaryngology.")
 
     disclaimer = ("⚠️ Not found in the textbook sources — the following is from "
-                  "general ENT knowledge and is not citation-grounded.\n\n")
+                  "general ENT knowledge, is not citation-grounded, and should be "
+                  "verified against a primary source.\n\n")
     return disclaimer + body
 
 
@@ -115,10 +126,21 @@ def answer(query, user_id="default"):
     )
 
     prompt = f"""Answer the question using the context below. Answer if the context supports it, even partially.
-If the context does not contain enough information, respond with EXACTLY this sentence and nothing else:
+If the context contains a relevant table or list — even one that seems partial or is
+formatted with pipes — USE it and present its contents. Do NOT refuse just because the
+table looks incomplete; give the user whatever relevant rows/entries the context contains.
+Respond with EXACTLY this sentence and nothing else ONLY if the context contains genuinely
+NOTHING relevant to the question:
 "{NO_INFO_MARKER}."
 Cite the document name and the page number for each claim you make, like [scott_brown, p.51].
 Be concise but do not lose information.
+When presenting tabular data, DO NOT use markdown tables or pipe characters (they do not
+render in Telegram). Instead format it as a readable indented list, grouping by category, e.g.:
+Infective:
+ - Tuberculosis (Myobacterium tuberculosis)
+ - Leprosy (Myobacterium leprae)
+Inflammatory:
+ - Sarcoidosis
 
 Context:
 {context}
@@ -132,8 +154,14 @@ Question: {search_query}"""
     )
     reply = extract_text(message)
 
-    # 3. if the sources were silent, ABANDON rag and escalate to Sonnet
-    if NO_INFO_MARKER.lower() in reply.lower():
+    # 3. escalate to Sonnet ONLY if Haiku's reply is essentially just the refusal
+    #    (a short reply that is basically the marker), not when it gave real content
+    #    that merely mentions incompleteness.
+    is_pure_refusal = (
+        NO_INFO_MARKER.lower() in reply.lower()
+        and len(reply.strip()) < len(NO_INFO_MARKER) + 30   # nothing much beyond the marker
+    )
+    if is_pure_refusal:
         print("[no info in sources -> escalating to Sonnet]")
         reply = sonnet_fallback(search_query)
         sources = []                      # fallback has no citations
