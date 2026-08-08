@@ -1,0 +1,6 @@
+torch
+sentence-transformers
+chromadb
+anthropic
+python-telegram-bot
+python-dotenv
