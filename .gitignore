@@ -1,0 +1,10 @@
+.env
+chroma_db/
+venv/
+__pycache__/
+extracted/
+previews/
+without_escalation to sonnet/
+*.pdf
+*.jsonl
+*.txt
