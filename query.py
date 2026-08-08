@@ -127,15 +127,12 @@ def answer(query, user_id="default"):
 
     prompt = f"""Answer the question using the context below. Answer if the context supports it, even partially.
 If the context contains a relevant table or list — even one that seems partial or is
-formatted with pipes — USE it and present its contents. Do NOT refuse just because the
-table looks incomplete; give the user whatever relevant rows/entries the context contains.
-Respond with EXACTLY this sentence and nothing else ONLY if the context contains genuinely
-NOTHING relevant to the question:
+formatted with pipes — USE it and present its contents.
+Respond with EXACTLY this sentence and nothing else ONLY if the context contains NOTHING relevant to the question:
 "{NO_INFO_MARKER}."
 Cite the document name and the page number for each claim you make, like [scott_brown, p.51].
 Be concise but do not lose information.
-When presenting tabular data, DO NOT use markdown tables or pipe characters (they do not
-render in Telegram). Instead format it as a readable indented list, grouping by category, e.g.:
+tables in the context are pipe-formatted; read them but re-present the content as an indented list, never with pipes, e.g.:
 Infective:
  - Tuberculosis (Myobacterium tuberculosis)
  - Leprosy (Myobacterium leprae)
@@ -154,14 +151,13 @@ Question: {search_query}"""
     )
     reply = extract_text(message)
 
-    # 3. escalate to Sonnet ONLY if Haiku's reply is essentially just the refusal
-    #    (a short reply that is basically the marker), not when it gave real content
-    #    that merely mentions incompleteness.
-    is_pure_refusal = (
-        NO_INFO_MARKER.lower() in reply.lower()
-        and len(reply.strip()) < len(NO_INFO_MARKER) + 30   # nothing much beyond the marker
-    )
-    if is_pure_refusal:
+    # 3. escalate to Sonnet ONLY when Haiku actually refused. The reliable signal
+    #    is the marker appearing at the START of the reply (Haiku leads with it when
+    #    it has nothing). A marker buried mid-answer means it gave real content, so
+    #    we keep the RAG answer.
+    first_line = reply.strip().lstrip('"').strip()
+    is_refusal = first_line.lower().startswith(NO_INFO_MARKER.lower())
+    if is_refusal:
         print("[no info in sources -> escalating to Sonnet]")
         reply = sonnet_fallback(search_query)
         sources = []                      # fallback has no citations
