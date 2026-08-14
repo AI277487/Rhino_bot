@@ -4,3 +4,4 @@ chromadb
 anthropic
 python-telegram-bot
 python-dotenv
+rank-bm25==0.2.2
