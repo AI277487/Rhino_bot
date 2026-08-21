@@ -72,12 +72,7 @@ except Exception as e:
     print(f"[supabase: init failed, logging OFF — {e}]")
 
 
-def log_query(question, answer, grounded):
-    """
-    Write one question/answer to the query_logs table. Best-effort only:
-    logging must NEVER break answering, so any failure is swallowed. The user
-    always gets their answer even if the database is down.
-    """
+def log_query(question, answer, grounded, user_email=None, user_name=None):
     if _supabase is None:
         return
     try:
@@ -85,6 +80,8 @@ def log_query(question, answer, grounded):
             "question": question,
             "answer": answer,
             "grounded": grounded,
+            "user_email": user_email,
+            "user_name": user_name,
         }).execute()
     except Exception as e:
         print(f"[supabase log failed (ignored): {e}]")
@@ -162,8 +159,10 @@ def chat(body: ChatIn, request: Request):
             content={"answer": "Please sign in to use RhinoBot.",
                      "citations": [], "grounded": False},
         )
-    user_id = user.id          # stable per-user id, used for logging and (next) caps
+    user_id = user.id  # stable per-user id, used for logging and (next) caps
     user_email = getattr(user, "email", None)
+    _meta = getattr(user, "user_metadata", None) or {}
+    user_name = _meta.get("full_name") or _meta.get("name") or None
 
     msg = (body.message or "").strip()
     if not msg:
@@ -173,11 +172,11 @@ def chat(body: ChatIn, request: Request):
         if body.mode == "general":
             # the frontend's "get general answer" button
             text = query.sonnet_fallback(msg)
-            log_query(msg, text, False)
+            log_query(msg, text, False, user_email=user_email, user_name=user_name)
             return {"answer": text, "citations": [], "grounded": False}
 
         reply, citations, grounded = query.answer(msg, user_id=user_id)
-        log_query(msg, reply, grounded)
+        log_query(msg, reply, grounded, user_email=user_email, user_name=user_name)
         return {"answer": reply, "citations": citations, "grounded": grounded}
 
 
