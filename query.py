@@ -1,6 +1,7 @@
 import os
 import chromadb
 import anthropic
+import json
 import re
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
@@ -43,6 +44,313 @@ _histories = {}
 
 HAIKU  = "claude-haiku-4-5"
 SONNET = "claude-sonnet-5"              # fallback model for general-knowledge answers
+PLANNER = SONNET                       # Sonnet plans retrieval (decompose + reformulate)
+# =============================================================================
+# TOKEN ACCOUNTING
+# Per-request accumulator. Every messages.create call appends via _track();
+# app.py calls reset_usage() before a request and pop_usage() after. The whole
+# pipeline is serialized under app.py's _lock, so this module-global only ever
+# holds one request's calls at a time. Captures ALL calls a request makes —
+# planner + generator, plus a fallback (and a wasted Haiku call on escalation).
+# =============================================================================
+PRICING = {   # USD per 1,000,000 tokens: {input, output}. Verified 2026-08-20.
+    "claude-haiku-4-5":  {"in": 1.00, "out": 5.00},
+    "claude-sonnet-5":   {"in": 2.00, "out": 10.00},   # may rise to 3/15 on Sep 1
+}
+_USAGE = []
+
+
+def _rate_for(model):
+    if model in PRICING:
+        return PRICING[model]
+    for key, rate in PRICING.items():          # tolerate dated/suffixed strings
+        if model.startswith(key) or key in model:
+            return rate
+    print(f"[usage: no price for '{model}' -> counted at $0]")
+    return None
+
+
+def _track(resp, model):
+    """Record token usage + cost for one messages.create call."""
+    u = getattr(resp, "usage", None)
+    inp = getattr(u, "input_tokens", 0) or 0
+    out = getattr(u, "output_tokens", 0) or 0
+    cr  = getattr(u, "cache_read_input_tokens", 0) or 0
+    cw  = getattr(u, "cache_creation_input_tokens", 0) or 0
+    rate = _rate_for(model)
+    if rate:
+        per_in, per_out = rate["in"] / 1_000_000, rate["out"] / 1_000_000
+        cost = inp * per_in + out * per_out + cr * per_in * 0.10 + cw * per_in * 1.25
+    else:
+        cost = 0.0
+    _USAGE.append({"model": model, "input_tokens": inp, "output_tokens": out,
+                   "cost_usd": round(cost, 6)})
+
+
+def reset_usage():
+    _USAGE.clear()
+
+
+def pop_usage():
+    """Sum every call tracked since the last reset, clear, and return a dict
+    ready to write to query_logs (scalars + a per-model breakdown)."""
+    calls = list(_USAGE)
+    _USAGE.clear()
+    inp  = sum(c["input_tokens"]  for c in calls)
+    out  = sum(c["output_tokens"] for c in calls)
+    cost = round(sum(c["cost_usd"] for c in calls), 6)
+    by_model = {}
+    for c in calls:
+        m = by_model.setdefault(c["model"],
+                                {"calls": 0, "input_tokens": 0,
+                                 "output_tokens": 0, "cost_usd": 0.0})
+        m["calls"]         += 1
+        m["input_tokens"]  += c["input_tokens"]
+        m["output_tokens"] += c["output_tokens"]
+        m["cost_usd"]       = round(m["cost_usd"] + c["cost_usd"], 6)
+    return {"input_tokens": inp, "output_tokens": out,
+            "total_tokens": inp + out, "cost_usd": cost,
+            "cost_breakdown": by_model}
+
+# =============================================================================
+# ACRONYM EXPANSION (query-time, model-agnostic)
+# MiniLM does not resolve medical acronyms: "complications of FESS" lands in a
+# weak vector region and retrieves FESS-revision junk, while the spelled-out
+# form retrieves correctly. We expand known acronyms before dense encode AND
+# BM25 so both retrievers see the meaning. The acronym is KEPT (BM25 still
+# matches the literal token in chunks) and the expansion is appended for dense.
+# =============================================================================
+with open(os.path.join(_HERE, "ent_acronyms.json"), "r", encoding="utf-8") as _f:
+    ACRONYMS = json.load(_f)
+
+# Lowercase forms we will NOT expand: real English words + ambiguous short
+# strings. Uppercase always expands regardless of this set.
+LOWERCASE_NO_EXPAND = {"an", "ar", "pet", "spa", "us"}
+
+_ACR_KEYS = sorted(ACRONYMS.keys(), key=len, reverse=True)  # longest-match first
+_ACRONYM_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _ACR_KEYS) + r")\b", re.IGNORECASE
+)
+_ACR_UPPER = {k.upper(): v for k, v in ACRONYMS.items()}
+
+
+def _should_expand(matched):
+    if matched.isupper():
+        return True                                    # uppercase always expands
+    return matched.lower() not in LOWERCASE_NO_EXPAND   # lowercase: unless blocked
+
+
+def expand_acronyms(query):
+    """'complications of FESS' -> 'complications of FESS (functional endoscopic sinus surgery)'"""
+    seen = set()
+
+    def _sub(m):
+        matched = m.group(1)
+        canon = matched.upper()
+        if not _should_expand(matched) or canon in seen:
+            return matched
+        seen.add(canon)
+        return f"{matched} ({_ACR_UPPER[canon]})"
+
+    return _ACRONYM_RE.sub(_sub, query)
+
+
+# =============================================================================
+# DETERMINISTIC BOOK ROUTING
+# Only restrict the search when the user EXPLICITLY names a book. No LLM, no
+# variance — a wrong restriction silently drops the right chunk, so this stays
+# deterministic. Maps user-facing spellings -> the actual metadata `source`
+# value. NOTE: the corpus stores Shambaugh's source as the misspelling
+# "shaumbaugh", so the user's correct "shambaugh" must map to that.
+# =============================================================================
+BOOK_ALIASES = {
+    "cummings":         "cummings",
+    "scott-brown":      "scott",
+    "scott brown":      "scott",
+    "scott":            "scott",
+    "stell and maran":  "stell",
+    "stell & maran":    "stell",
+    "stell":            "stell",
+    "shambaugh":        "shaumbaugh",   # user spelling -> metadata spelling
+    "shaumbaugh":       "shaumbaugh",
+}
+_ALIASES_SORTED = sorted(BOOK_ALIASES.keys(), key=len, reverse=True)
+
+
+def detect_books(question):
+    """Return a list of source strings if the user explicitly named book(s),
+    else None (search all books)."""
+    q = question.lower()
+    found = []
+    for alias in _ALIASES_SORTED:
+        if alias in q:
+            src = BOOK_ALIASES[alias]
+            if src not in found:
+                found.append(src)
+            q = q.replace(alias, " ")   # consume so shorter aliases can't re-match
+    return found or None
+
+
+# =============================================================================
+# SONNET QUERY PLANNER  (Sonnet plans retrieval, Haiku writes the answer)
+# Two kinds of decomposition, each gated:
+#   - TOPIC   (multi-entity "X vs Y")            -> split by entity
+#   - FACET   (single broad UNSCOPED entity "X") -> optionally split by clinical
+#             facet (diagnosis/management/complications) ONLY if the user did
+#             not already pick a facet
+#   - NEITHER (already focused: "treatment of X", "complications of FESS") -> one search
+# Sonnet reformulates into textbook terminology but must NOT inject specific
+# drugs/facts/sub-topics the user didn't ask about — it rephrases the question,
+# it does not pre-answer it. That preserves the "books decide, not the model"
+# guarantee the citations rest on. Book selection is NOT Sonnet's job — that is
+# handled deterministically by detect_books().
+# =============================================================================
+PLAN_TOOL = {
+    "name": "search_plan",
+    "strict": True,
+    "description": (
+        "Plan how to answer the user's ENT question. Return (1) the standalone "
+        "question the assistant should ANSWER, with any follow-up references "
+        "resolved from the conversation, and (2) the search sub-queries used to "
+        "RETRIEVE textbook chunks."
+    ),
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "standalone_question": {
+                "type": "string",
+                "description": (
+                    "The complete, self-contained question the assistant should "
+                    "answer, phrased as a real question a person would ask. "
+                    "Resolve follow-up references from the conversation: "
+                    "'give more complications' after a FESS question becomes "
+                    "'What are the complications of FESS not already covered "
+                    "above?'. This is what the ANSWERING model reads — it must "
+                    "be a full question, NOT a search fragment or keyword list."
+                ),
+            },
+            "sub_queries": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "1-4 self-contained search strings in formal textbook "
+                    "terminology (these can be terse). Prefer FEWER, higher-"
+                    "quality sub-queries — do not manufacture a marginal extra "
+                    "facet just to add one. Return ONE for a focused "
+                    "question. For a BROAD question (complications / types / "
+                    "causes / features / management of something, or a bare "
+                    "entity name), break it into the natural sub-topics a "
+                    "textbook covers as separate sections — one query per "
+                    "sub-topic — so each lands in its own part of the corpus. "
+                    "For a MULTI-TOPIC question (comparison / two asks), one "
+                    "query per topic. Expand acronyms; use textbook vocabulary. "
+                    "For a 'give more' follow-up, target the sub-topics NOT "
+                    "already covered in the previous answer."
+                ),
+            },
+        },
+        "required": ["standalone_question", "sub_queries"],
+    },
+}
+
+PLANNER_SYSTEM = (
+    "You are the retrieval planner for a citation-grounded ENT (otolaryngology) "
+    "exam-prep assistant. The corpus is four standard ENT textbooks, and every "
+    "sub-query is searched across ALL of them together — you do NOT choose which "
+    "book to search and must NOT tailor wording toward any single one. You have "
+    "strong ENT knowledge; use it to plan retrieval that yields the most "
+    "COMPLETE, well-grounded set of chunks. Each answer cites specific textbook "
+    "pages, so the chunks you cause to be retrieved determine answer quality.\n\n"
+    "Return two things via search_plan:\n\n"
+    "A) standalone_question — the full question the assistant should ANSWER, "
+    "with follow-up references resolved from the conversation. If the user says "
+    "'give more complications' after a FESS answer, resolve it to 'What are the "
+    "complications of FESS not already covered above?'. It MUST read as a "
+    "complete question, never a keyword fragment.\n\n"
+    "B) sub_queries — the searches that retrieve chunks:\n"
+    "- FOCUSED question (one topic + one facet) -> ONE query. "
+    "e.g. 'otoscopic appearance of cholesteatoma'.\n"
+    "- MULTI-TOPIC (comparison / two asks) -> one query PER topic. "
+    "e.g. 'CSOM vs cholesteatoma' -> a query for each.\n"
+    "- BROAD (complications / types / causes / features / management of X, or a "
+    "bare entity) -> break into the natural sub-topics a textbook covers as "
+    "SEPARATE SECTIONS, one query each, using your ENT knowledge to choose them. "
+    "e.g. 'complications of FESS' -> hemorrhagic complications of endoscopic "
+    "sinus surgery; orbital complications of endoscopic sinus surgery; "
+    "intracranial and CSF leak complications of endoscopic sinus surgery; local "
+    "complications of endoscopic sinus surgery (synechiae, nasolacrimal injury, "
+    "anosmia).\n"
+    "Prefer FEWER, well-chosen sub-topics (typically 3-4 max). Do not invent a "
+    "thin extra facet just to pad the list — a marginal sub-query pulls weak "
+    "chunks that can crowd out strong ones.\n"
+    "- 'GIVE MORE' follow-up -> target the sub-topics NOT already covered in the "
+    "previous answer shown in the conversation.\n\n"
+    "Reformulate each sub-query for RETRIEVAL, which matches literal words:\n"
+    "- Expand acronyms (FESS -> functional endoscopic sinus surgery).\n"
+    "- Convert lay terms to medical terms (ringing in ears -> tinnitus).\n"
+    "- Prefer the COMMON clinical term the textbook actually prints, and include "
+    "key synonyms, because a formal term alone can miss the passage. Use "
+    "'bleeding epistaxis' not just 'hemorrhagic'; 'CSF leak cerebrospinal fluid' "
+    "not just one; include both a term and its close synonyms in the same "
+    "sub-query when they differ.\n\n"
+    "Two rules to hold:\n"
+    "1. PRESERVE SCOPE. If the user narrowed to one facet ('treatment of X'), "
+    "decompose WITHIN it (medical vs surgical management) but do not wander into "
+    "other facets.\n"
+    "2. Search by CATEGORY, not by specific answer. Name the sub-topic to look "
+    "in ('medical management of otosclerosis'), not the specific facts you "
+    "expect to find. You decide WHERE to look; the textbook decides WHAT is there."
+)
+
+
+def plan_query(question, history=None):
+    """Ask Sonnet for a search plan. Returns (standalone_question, sub_queries).
+    standalone_question is what generation answers; sub_queries drive retrieval.
+    Falls back to (question, [question]) if anything goes wrong."""
+    if history:
+        recent = "\n".join(history[-6:])   # include prior answer so 'more' works
+        content = (f"Conversation so far:\n{recent}\n\n"
+                   f"Current question: {question}")
+    else:
+        content = question
+    try:
+        msg = anthropic_client.messages.create(
+            model=PLANNER,
+            max_tokens=1024,
+            thinking={"type": "disabled"},
+            system=PLANNER_SYSTEM,
+            tools=[PLAN_TOOL],
+            tool_choice={"type": "tool", "name": "search_plan"},
+            messages=[{"role": "user", "content": content}],
+        )
+        _track(msg, PLANNER)
+        plan = next((b.input for b in msg.content
+                     if getattr(b, "type", None) == "tool_use"), None)
+        if not plan:
+            return question, [question]
+        standalone = (plan.get("standalone_question") or question).strip()
+
+        raw_subs = plan.get("sub_queries")
+        # schema is NOT strictly enforced: a malformed/truncated tool call can
+        # return sub_queries as a STRING, which iterates into characters and
+        # explodes retrieval. Wrap a string into a single-item list.
+        if isinstance(raw_subs, str):
+            raw_subs = [raw_subs]
+        if not isinstance(raw_subs, list):
+            raw_subs = [standalone]
+        subs = [s.strip() for s in raw_subs if isinstance(s, str) and s.strip()]
+
+        # if we still got a pile of 1-char fragments (explosion signature),
+        # discard and fall back to the standalone question — stays GROUNDED.
+        if subs and sum(len(s) for s in subs) / len(subs) < 3:
+            print("[planner sub_queries fragmented -> using standalone]")
+            subs = [standalone]
+
+        return standalone, (subs if subs else [standalone])
+    except Exception as e:
+        print(f"[planner error -> single search: {e}]")
+        return question, [question]
 
 
 def extract_text(msg):
@@ -57,6 +365,90 @@ def extract_text(msg):
 # Exact phrase we instruct Haiku to emit when the corpus can't answer.
 # Detecting it is how we decide to escalate to Sonnet.
 NO_INFO_MARKER = "The provided sources do not address this"
+
+
+# --- citation + table-cleanup helpers (added for the web frontend) ---------
+# Matches the frontend's own regex so markers and citation objects line up.
+CITE_RE = re.compile(r"\[([a-z]+),?\s*p\.?\s*(\d+)\]", re.I)
+
+
+def _is_ruler_line(line):
+    """A markdown separator line like |---|---| — noise in the source drawer."""
+    s = line.strip()
+    return bool(s) and set(s) <= set("|-: ")
+
+
+def collapse_dup_cells(text):
+    """
+    Cosmetic repair for Docling's column-duplication artifact: a merged or
+    single-column cell splayed across N columns as identical copies, e.g.
+        | TX | Unable to assess | Unable to assess | Unable to assess |
+    collapses to
+        TX | Unable to assess
+    Facts are never dropped — only exact repeats of the SAME value in a row.
+    Trivial short cells (M0, N1, 5.0) are left alone so real staging rows and
+    numeric tables are untouched. Used only when we hand a chunk to the drawer.
+    """
+    if "|" not in text:
+        return text.strip()
+    out = []
+    for line in text.split("\n"):
+        if _is_ruler_line(line):
+            continue
+        if "|" in line:
+            cells = [c.strip() for c in line.split("|")]
+            if cells and cells[0] == "":
+                cells = cells[1:]
+            if cells and cells[-1] == "":
+                cells = cells[:-1]
+            non_empty = [c for c in cells if c]
+            if len(non_empty) >= 2 and len(set(non_empty)) == 1:
+                # whole row was one value splayed across every column
+                line = non_empty[0]
+            else:
+                collapsed = []
+                for c in cells:
+                    # drop a non-trivial cell that just repeats the previous one
+                    if collapsed and c == collapsed[-1] and len(c) >= 20:
+                        continue
+                    collapsed.append(c)
+                line = " | ".join(c for c in collapsed if c)
+        out.append(line)
+    return "\n".join(l for l in out if l.strip()).strip()
+
+
+def build_citations(answer_text, picked):
+    """
+    Turn the [book, p.N] markers Haiku wrote into the citation objects the
+    frontend needs: {id, book, page, chunk_text}. One entry per distinct
+    (book, page) actually cited, in order of first appearance, backed by the
+    highest-ranked retrieved chunk for that page. Markers with no matching
+    retrieved chunk are skipped (the chip still renders via the frontend's
+    {book,page} fallback, just without a source passage).
+    """
+    by_key = {}
+    for rec in picked:  # picked is already rrf-sorted, so first = best
+        m = rec["meta"]
+        key = (str(m.get("source", "")).lower(), str(m.get("page", "")))
+        by_key.setdefault(key, rec)
+
+    seen, cites = set(), []
+    for mo in CITE_RE.finditer(answer_text):
+        book, page = mo.group(1).lower(), mo.group(2)
+        key = (book, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        rec = by_key.get(key)
+        if not rec:
+            continue
+        cites.append({
+            "id": rec["id"],
+            "book": book,
+            "page": int(page),
+            "chunk_text": collapse_dup_cells(rec["doc"]),
+        })
+    return cites
 
 
 CONTEXTUALIZE_TOOL = {
@@ -81,12 +473,22 @@ def contextualize(query, history):
     if not history:
         return query
 
-    # skip the LLM entirely for clearly-standalone questions (no back-reference)
+    # skip the LLM entirely ONLY for clearly-standalone questions. Two things
+    # signal a follow-up that needs rewriting even without a pronoun:
+    #   - back-reference pronouns (it/this/they/that ...)
+    #   - continuation/elaboration words (more/else/other/another/also/continue
+    #     /expand/further ...) — "give more complications" has NO pronoun but is
+    #     entirely dependent on the previous turn.
     words = query.lower().split()
     has_backref = any(w in words for w in
                       ("it", "its", "this", "that", "they", "them", "these",
                        "those", "he", "she", "his", "her", "their", "one"))
-    if not has_backref and len(words) >= 3:
+    has_continuation = any(w in words for w in
+                      ("more", "else", "other", "others", "another", "also",
+                       "additional", "additionally", "continue", "expand",
+                       "further", "elaborate", "again", "rest"))
+    is_short = len(words) < 4          # short fragments are usually follow-ups
+    if not has_backref and not has_continuation and not is_short:
         return query
 
     recent = "\n".join(history[-4:])
@@ -179,8 +581,6 @@ FALLBACK_SYSTEM = (
     f"{OUT_OF_SCOPE_MARKER}\n"
     "When you answer, be accurate and concise, focus on the ENT angle, do NOT "
     "fabricate citations or page numbers, and say so if you are uncertain.\n"
-    "Do NOT use markdown tables or pipe characters (they don't render in Telegram); "
-    "present any tabular data as a readable indented list grouped by category."
 )
 
 
@@ -196,6 +596,7 @@ def sonnet_fallback(question):
         system=FALLBACK_SYSTEM,
         messages=[{"role": "user", "content": question}],
     )
+    _track(msg, SONNET)
     body = extract_text(msg)
 
     if OUT_OF_SCOPE_MARKER in body:
@@ -208,10 +609,16 @@ def sonnet_fallback(question):
                   "verified against a primary source.\n\n")
     return disclaimer + body
 
-def retrieve_filtered(query_text, raw_k=60, keep=8, rrf_k=60):
+def retrieve_filtered(query_text, raw_k=60, keep=9, rrf_k=60, sources=None):
+    query_text = expand_acronyms(query_text)   # acronym-blindness fix (both retrievers)
+
+    # optional book filter: only restrict when detect_books() found an explicit mention
+    where = {"source": {"$in": sources}} if sources else None
+
     # --- dense (MiniLM / vector) ---
     q_emb = embedder.encode([query_text]).tolist()
     dres = collection.query(query_embeddings=q_emb, n_results=raw_k,
+                            where=where,
                             include=["documents", "metadatas", "distances"])
     dense_ids = dres["ids"][0]
     dense_lookup = {cid: {"doc": dres["documents"][0][i],
@@ -221,9 +628,18 @@ def retrieve_filtered(query_text, raw_k=60, keep=8, rrf_k=60):
 
     # --- sparse (BM25 / keyword) ---
     scores = _bm25.get_scores(_tok(query_text))
+    # widen the BM25 pull when filtering, so post-filtering to chosen books
+    # doesn't starve the fused candidate set.
+    bm_k = raw_k * (3 if sources else 1)
     top_idx = sorted(range(len(scores)), key=lambda i: scores[i],
-                     reverse=True)[:raw_k]
+                     reverse=True)[:bm_k]
     sparse_ids = [_ALL_IDS[i] for i in top_idx]
+    if sources:
+        # BM25 has no `where`; post-filter its hits to the chosen books so the
+        # fusion stays consistent with the (already-filtered) dense side.
+        allowed = set(sources)
+        sparse_ids = [cid for cid in sparse_ids
+                      if _ALL_METAS[_ID_TO_IDX[cid]].get("source") in allowed][:raw_k]
 
     # --- Reciprocal Rank Fusion: combine the two rankings by position ---
     rrf = {}
@@ -255,6 +671,10 @@ def retrieve_filtered(query_text, raw_k=60, keep=8, rrf_k=60):
             if idx is None:
                 continue
             doc, meta = _ALL_DOCS[idx], _ALL_METAS[idx]
+        # Known-corrupt Weber/Rinne table (semantic cross-wiring, clinically
+        # unsafe): drop the whole p83 table family until re-extraction.
+        if cid.startswith("cummings_p83_t0_28"):
+            continue
         # same stub filter as before
         is_prose_stub = (meta.get("type") == "prose"
                          and not meta.get("is_figure")
@@ -268,25 +688,73 @@ def retrieve_filtered(query_text, raw_k=60, keep=8, rrf_k=60):
 def answer(query, user_id="default"):
     history = _histories.setdefault(user_id, [])
 
-    # 1. rewrite follow-ups into standalone questions
-    search_query = contextualize(query, history)
-    print(f"[searching for: {search_query}]")
+    # 1. deterministic book routing: restrict ONLY if the user named a book
+    books = detect_books(query)
+    if books:
+        print(f"[book filter: user named {books}]")
 
-    # 2. retrieve across all books and try to answer FROM the sources (Haiku)
-    # 2. decompose, retrieve per sub-query, merge (dedupe by chunk id, keep best dist)
-    subqueries = decompose(search_query)
-    print(f"[subqueries: {subqueries}]")
+    # 2. Sonnet plans in ONE call: resolves the follow-up into a standalone
+    #    question (what Haiku answers) AND decomposes into retrieval sub-queries.
+    #    This replaces both contextualize() and decompose().
+    search_query, subqueries = plan_query(query, history)
+    print(f"[answer question: {search_query}]")
+    print(f"[plan: {subqueries}]")
 
-    per_keep = 15 if len(subqueries) == 1 else 8
-    merged = {}
+    # 3. retrieve per sub-query, then merge with PER-SUB-QUERY QUOTAS.
+    #    Problem this fixes: a global RRF sort lets one "loud" sub-query (high
+    #    RRF chunks) fill the cap and drown other facets (e.g. Q4 cholesteatoma:
+    #    the definition facet crowded out otoscopy + management). Fix: guarantee
+    #    each sub-query a reserved share of the final slots, so every facet the
+    #    planner identified reaches the answer. A QUALITY FLOOR means a sub-query
+    #    only claims reserved slots if its chunks are actually good — so the
+    #    planner gains nothing from padding the plan with weak extra sub-queries.
+    SUBQUERY_QUOTA = 2 if len(subqueries) <= 4 else 1  # fewer reserved when many subs
+    QUOTA_FLOOR = 0.015      # a chunk must clear this RRF to claim a reserved slot
+    FINAL_CAP = 16
+    per_keep = 16 if len(subqueries) == 1 else 9
+
+    # retrieve per sub-query, keep grouped (each in its own RRF-sorted list)
+    groups = []
     for sq in subqueries:
-        for rec in retrieve_filtered(sq, raw_k=60, keep=per_keep):
-            cid = rec["id"]
-            if cid not in merged or rec["rrf"] > merged[cid]["rrf"]:  # <- changed
-                merged[cid] = rec
+        hits = retrieve_filtered(sq, raw_k=60, keep=per_keep, sources=books)
+        groups.append(hits)   # already rrf-sorted by retrieve_filtered
 
-    FINAL_CAP = 15
-    picked = sorted(merged.values(), key=lambda r: r["rrf"],  # <- changed
+    # PASS 1 - reservation: each sub-query reserves up to SUBQUERY_QUOTA of its
+    # best chunks that clear the floor and aren't already taken. A sub-query with
+    # nothing above floor reserves nothing (anti-padding).
+    picked_by_id = {}
+    for hits in groups:
+        taken = 0
+        for rec in hits:
+            if taken >= SUBQUERY_QUOTA:
+                break
+            cid = rec["id"]
+            if cid in picked_by_id:          # already reserved by an earlier sub-query
+                continue
+            if rec["rrf"] < QUOTA_FLOOR:      # below quality floor -> don't reserve
+                continue
+            picked_by_id[cid] = rec
+            taken += 1
+
+    # PASS 2 - global fill: pool everything not yet picked, sort by RRF, fill the
+    # remaining slots up to FINAL_CAP. Keeps best global chunks AND lets a rich
+    # facet earn extra representation beyond its reserved quota.
+    pool = {}
+    for hits in groups:
+        for rec in hits:
+            cid = rec["id"]
+            if cid in picked_by_id:
+                continue
+            if cid not in pool or rec["rrf"] > pool[cid]["rrf"]:
+                pool[cid] = rec
+    fill = sorted(pool.values(), key=lambda r: r["rrf"], reverse=True)
+    for rec in fill:
+        if len(picked_by_id) >= FINAL_CAP:
+            break
+        picked_by_id[rec["id"]] = rec
+
+    # final ordering by RRF for the context (reserved + filled together)
+    picked = sorted(picked_by_id.values(), key=lambda r: r["rrf"],
                     reverse=True)[:FINAL_CAP]
     docs = [r["doc"] for r in picked]
     metas = [r["meta"] for r in picked]
@@ -297,13 +765,6 @@ def answer(query, user_id="default"):
     )
     print(f"[context: {len(docs)} chunks, {len(context)} chars]")
     print(f"[sources: {[(m.get('source'), m.get('page')) for m in metas]}]")
-
-    context = "\n\n".join(
-        f"[{m.get('source', 'unknown')}, p.{m.get('page', '?')}]\n{d}"
-        for d, m in zip(docs, metas)
-    )
-    print(f"[context: {len(docs)} chunks, {len(context)} chars]")  # <-- add
-    print(f"[sources: {[(m.get('source'), m.get('page')) for m in metas]}]")
     if not docs:
         print("[empty context -> Sonnet fallback]")
         reply = sonnet_fallback(search_query)
@@ -311,7 +772,7 @@ def answer(query, user_id="default"):
         history.append(f"Assistant: {reply}")
         if len(history) > 20:
             del history[:-20]
-        return reply, []
+        return reply, [], False
     prompt= f"""You are answering a medical question using retrieved textbook excerpts.
 
 The context below contains excerpts from one or more ENT textbooks. Your job is to
@@ -331,13 +792,18 @@ sentence and nothing else:
 "{NO_INFO_MARKER}."
 
 When you answer:
-- Cite the document name and page for each claim, like [cummings, p.318].
+- Cite the document name and page for each claim. Cite each source in its own
+  bracket, with one book and one page per bracket:
+    [cummings, p.3431] [shaumbaugh, p.1042]   correct
+  Never combine two sources in one bracket, and never use a page range. Write
+  separate brackets instead:
+    [cummings, p.3431; shaumbaugh, p.1042]    wrong  (two sources grouped)
+    [shaumbaugh, p.742-743]                   wrong  (page range)
 - Be concise but complete; do not drop information.
-- Re-present any pipe-formatted table as an indented list, never with pipes, e.g.:
-  Infective:
-   - Tuberculosis (Mycobacterium tuberculosis)
-  Inflammatory:
-   - Sarcoidosis
+- If an excerpt contains a pipe-formatted table, REPRODUCE it as a markdown
+  table: keep the pipes, and include the |---| header-separator row so it
+  renders as a grid. Preserve the column meaning; do not invent columns.
+  Use an indented list only for non-tabular grouped data, not for real tables.
 
 Context:
 {context}
@@ -349,6 +815,7 @@ Question: {search_query}"""
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
+    _track(message, HAIKU)
     reply = extract_text(message)
 
     # 3. escalate to Sonnet ONLY when Haiku actually refused. The reliable signal
@@ -362,12 +829,11 @@ Question: {search_query}"""
     if is_refusal:
         print("[no info in sources -> escalating to Sonnet]")
         reply = sonnet_fallback(search_query)
-        sources = []                      # fallback has no citations
+        citations = []                    # fallback has no grounded citations
+        grounded = False
     else:
-        sources = [
-            {"source": m.get("source"), "page": m.get("page")}
-            for m in metas
-        ]
+        citations = build_citations(reply, picked)
+        grounded = True
 
     # 4. record the turn for this user's follow-up context
     history.append(f"User: {query}")
@@ -375,7 +841,7 @@ Question: {search_query}"""
     if len(history) > 20:
         del history[:-20]
 
-    return reply, sources
+    return reply, citations, grounded
 
 
 if __name__ == "__main__":
@@ -383,6 +849,7 @@ if __name__ == "__main__":
         que = input("\nAsk (or 'quit'): ")
         if que.lower() == "quit":
             break
-        text, srcs = answer(que)
+        text, cites, grounded = answer(que)
         print("\n" + text)
-        print("sources:", srcs)
+        print("grounded:", grounded)
+        print("citations:", [(c["book"], c["page"]) for c in cites])

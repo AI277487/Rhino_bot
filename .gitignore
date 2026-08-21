@@ -8,3 +8,4 @@ without_escalation to sonnet/
 *.pdf
 *.jsonl
 *.txt
+chroma_db.bak/
