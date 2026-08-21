@@ -16,7 +16,7 @@ and put HTTPS in front of it (see deploy notes).
 import os
 import threading
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -90,6 +90,31 @@ def log_query(question, answer, grounded):
         print(f"[supabase log failed (ignored): {e}]")
 
 
+def verify_user(request):
+    """
+    Read the 'Authorization: Bearer <token>' header, ask Supabase whether the
+    token is genuine and unexpired, and return the user (with .id and .email)
+    if so — otherwise None. This is the server-side gate: no valid token, no
+    user, no answer. Uses Supabase's own validation, so we never trust the
+    token blindly.
+    """
+    if _supabase is None:
+        return None
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        # ask Supabase to validate the token and tell us who it belongs to
+        res = _supabase.auth.get_user(token)
+        return res.user if res and res.user else None
+    except Exception as e:
+        print(f"[token verify failed: {e}]")
+        return None
+
+
 class ChatIn(BaseModel):
     message: str
     session_id: str = "default"
@@ -125,15 +150,20 @@ def health():
 
 
 @app.post("/chat")
-def chat(body: ChatIn):
-    # Gate: if a password is configured, the request must carry the right one.
-    # Checked BEFORE any retrieval or model call, so a wrong password costs $0.
-    if _ACCESS_PASSWORD and body.passcode.strip() != _ACCESS_PASSWORD:
+def chat(body: ChatIn, request: Request):
+    # --- Auth gate: require a valid Supabase login token ---
+    # Checked BEFORE any retrieval or model call, so an unauthenticated
+    # request costs $0. This is the real server-side gate — the login screen
+    # on the frontend is not enough on its own.
+    user = verify_user(request)
+    if user is None:
         return JSONResponse(
             status_code=401,
-            content={"answer": "Access denied — wrong or missing password.",
+            content={"answer": "Please sign in to use RhinoBot.",
                      "citations": [], "grounded": False},
         )
+    user_id = user.id          # stable per-user id, used for logging and (next) caps
+    user_email = getattr(user, "email", None)
 
     msg = (body.message or "").strip()
     if not msg:
@@ -146,7 +176,7 @@ def chat(body: ChatIn):
             log_query(msg, text, False)
             return {"answer": text, "citations": [], "grounded": False}
 
-        reply, citations, grounded = query.answer(msg, user_id=body.session_id)
+        reply, citations, grounded = query.answer(msg, user_id=user_id)
         log_query(msg, reply, grounded)
         return {"answer": reply, "citations": citations, "grounded": grounded}
 
