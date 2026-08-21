@@ -11,3 +11,4 @@ python_files_from_claude/
 *.pdf
 *.jsonl
 *.txt
+chroma_db.bak/

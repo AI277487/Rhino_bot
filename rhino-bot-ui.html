@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>RhinoBot — ENT Reference</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#2C6E6A" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="RhinoBot" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+<link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+
+<!--
+  ============================================================================
+  RHINO BOT — frontend (single file, React via CDN, nothing to install)
+  ============================================================================
+  Features:
+   - Mobile-first (100dvh, 16px inputs, safe-area padding, big tap targets)
+   - Tappable citations -> source drawer showing the real textbook passage
+   - Grounded / general-knowledge states, + "get general answer" button
+   - REAL TABLE GRIDS in answers (parses markdown | pipe | tables)
+   - COPY button per answer with DUAL-FORMAT clipboard:
+       * paste into Word/Google Docs/email -> tables become REAL tables
+       * paste into plain-text notes/WhatsApp -> clean aligned text
+     (Rich copy needs HTTPS or localhost; falls back to plain text on file://)
+
+  Still uses a FAKE backend (mockApi). Swap its guts for fetch() later.
+  ============================================================================
+-->
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+<style>
+  :root {
+    --paper:#FBFAF7; --card:#FFFFFF; --ink:#1C1F26; --ink-soft:#545A66;
+    --line:#E6E3DC; --accent:#2C6E6A; --accent-ink:#1B4A47; --accent-wash:#EAF1F0;
+    --user-bubble:#EEF1F4; --warn:#A8641B; --warn-wash:#FBF2E4; --radius:14px;
+    --mono:'IBM Plex Mono',monospace; --sans:'Inter',system-ui,sans-serif; --serif:'Newsreader',Georgia,serif;
+  }
+  * { box-sizing:border-box; }
+  html, body {
+    margin:0; padding:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); -webkit-font-smoothing:antialiased; -webkit-text-size-adjust:100%;
+  }
+  #root { height:100dvh; }
+  .app { display:flex; flex-direction:column; height:100dvh; max-width:820px; margin:0 auto; background:var(--paper); }
+
+  .header {
+    padding:14px 16px 12px; padding-top:calc(14px + env(safe-area-inset-top));
+    border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+  }
+  .logo { font-family:var(--serif); font-size:22px; font-weight:600; letter-spacing:-0.01em; }
+  .logo .accent { color:var(--accent); }
+  .tagline { font-size:12.5px; color:var(--ink-soft); }
+  .corpus-note { margin-left:auto; font-size:10px; color:var(--ink-soft); font-family:var(--mono); text-transform:uppercase; letter-spacing:0.04em; display:none; }
+
+  .messages { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:18px 16px; display:flex; flex-direction:column; gap:18px; }
+
+  .welcome { margin:auto; text-align:center; max-width:460px; color:var(--ink-soft); padding:0 8px; }
+  .welcome h2 { font-family:var(--serif); font-weight:500; font-size:21px; color:var(--ink); margin:0 0 10px; }
+  .welcome p { font-size:14px; line-height:1.6; margin:0 0 18px; }
+  .examples { display:flex; flex-direction:column; gap:8px; }
+  .example-chip {
+    text-align:left; background:var(--card); border:1px solid var(--line); border-radius:11px;
+    padding:13px 15px; font-size:14px; color:var(--ink); cursor:pointer; min-height:46px; transition:border-color .15s, background .15s;
+  }
+  .example-chip:active { border-color:var(--accent); background:var(--accent-wash); }
+
+  .msg { display:flex; flex-direction:column; }
+  .msg.user { align-items:flex-end; }
+  .msg.bot  { align-items:flex-start; }
+  .bubble { max-width:92%; padding:14px 16px; border-radius:var(--radius); font-size:15px; line-height:1.6; }
+  .msg.user .bubble { background:var(--user-bubble); border-bottom-right-radius:5px; }
+  .msg.bot  .bubble { background:var(--card); border:1px solid var(--line); border-bottom-left-radius:5px; position:relative; }
+
+  .bubble h3 { font-family:var(--serif); font-weight:600; font-size:16px; margin:15px 0 6px; }
+  .bubble h3:first-child { margin-top:0; }
+  .bubble p { margin:0 0 9px; }
+  .bubble ul { margin:0 0 9px; padding-left:19px; }
+  .bubble li { margin:3px 0; }
+  .bubble strong { font-weight:600; }
+
+  /* ---- real table grids inside answers ---- */
+  .ans-table-wrap { overflow-x:auto; margin:10px 0; -webkit-overflow-scrolling:touch; }
+  .ans-table {
+    border-collapse:collapse; width:100%; font-size:13.5px; min-width:340px;
+  }
+  .ans-table th, .ans-table td {
+    border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top;
+  }
+  .ans-table th {
+    background:var(--accent-wash); color:var(--accent-ink); font-weight:600;
+    font-family:var(--sans); white-space:nowrap;
+  }
+  .ans-table tr:nth-child(even) td { background:#FAFAF7; }
+
+  .cite {
+    display:inline-flex; align-items:center; gap:4px; background:var(--accent-wash);
+    color:var(--accent-ink); border:1px solid #CFE0DE; border-radius:6px; padding:2px 7px; margin:0 1px;
+    font-family:var(--mono); font-size:12.5px; font-weight:500; cursor:pointer;
+    vertical-align:baseline; white-space:nowrap; transition:background .12s, border-color .12s;
+  }
+  .cite:active { background:#DCEAE8; border-color:var(--accent); }
+  .cite::before { content:"§"; opacity:.6; font-size:11px; }
+
+  .badge {
+    display:inline-flex; align-items:center; gap:6px; font-size:10.5px; font-weight:500;
+    font-family:var(--mono); text-transform:uppercase; letter-spacing:0.05em; padding:3px 9px; border-radius:20px; margin-bottom:10px;
+  }
+  .badge.grounded { background:var(--accent-wash); color:var(--accent-ink); }
+  .badge.general  { background:var(--warn-wash); color:var(--warn); }
+
+  .warn-note { background:var(--warn-wash); border:1px solid #EBD9BC; color:var(--warn); border-radius:10px; padding:10px 13px; font-size:13px; line-height:1.5; margin-bottom:12px; }
+
+  /* ---- action row under an answer (copy + general) ---- */
+  .actions { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .copy-btn {
+    display:inline-flex; align-items:center; gap:6px; background:var(--card);
+    border:1px solid var(--line); color:var(--ink-soft); border-radius:9px; padding:7px 12px;
+    font-family:var(--sans); font-size:12.5px; font-weight:500; cursor:pointer; min-height:38px;
+    transition:border-color .15s, color .15s, background .15s;
+  }
+  .copy-btn:active { border-color:var(--accent); color:var(--accent-ink); background:var(--accent-wash); }
+  .copy-btn.done { border-color:var(--accent); color:var(--accent-ink); background:var(--accent-wash); }
+
+  .more-btn {
+    display:inline-flex; align-items:center; gap:7px; background:transparent; border:1px dashed #C9BFA8;
+    color:var(--warn); border-radius:9px; padding:7px 12px; font-family:var(--sans); font-size:12.5px;
+    font-weight:500; cursor:pointer; min-height:38px; transition:background .15s, border-color .15s;
+  }
+  .more-btn:active { background:var(--warn-wash); border-color:var(--warn); }
+  .more-btn:disabled { opacity:.5; cursor:default; }
+
+  .typing { display:inline-flex; gap:5px; padding:4px 2px; }
+  .typing span { width:7px; height:7px; border-radius:50%; background:var(--accent); opacity:.4; animation:blink 1.2s infinite; }
+  .typing span:nth-child(2){ animation-delay:.2s } .typing span:nth-child(3){ animation-delay:.4s }
+  .load-status { display:flex; align-items:center; gap:9px; font-size:13.5px; color:var(--ink-soft); font-family:var(--serif); }
+  .load-status .dot { width:7px; height:7px; border-radius:50%; background:var(--accent); animation:blink 1s infinite; flex:none; }
+  .load-status .label { transition:opacity .25s; }
+  @keyframes blink { 0%,60%,100%{opacity:.25} 30%{opacity:.9} }
+
+  .composer {
+    border-top:1px solid var(--line); padding:12px 14px; padding-bottom:calc(12px + env(safe-area-inset-bottom));
+    display:flex; gap:9px; align-items:flex-end; background:var(--paper);
+  }
+  .composer textarea {
+    flex:1; resize:none; border:1px solid var(--line); border-radius:12px; padding:12px 14px;
+    font-family:var(--sans); font-size:16px; line-height:1.45; max-height:130px; background:var(--card); color:var(--ink); outline:none; transition:border-color .15s;
+  }
+  .composer textarea:focus { border-color:var(--accent); }
+  .send-btn {
+    background:var(--accent); color:#fff; border:none; border-radius:12px; padding:0 18px; height:48px;
+    font-family:var(--sans); font-size:15px; font-weight:600; cursor:pointer; flex-shrink:0; transition:background .15s, opacity .15s;
+  }
+  .send-btn:active:not(:disabled) { background:var(--accent-ink); }
+  .send-btn:disabled { opacity:.4; cursor:not-allowed; }
+
+  .drawer-scrim { position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .2s; z-index:40; }
+  .drawer-scrim.open { opacity:1; pointer-events:auto; }
+  .drawer { position:fixed; left:0; right:0; bottom:0; max-width:820px; margin:0 auto; background:var(--card); border-top-left-radius:20px; border-top-right-radius:20px; box-shadow:0 -8px 40px rgba(20,22,28,0.18); transform:translateY(100%); transition:transform .26s cubic-bezier(.2,.8,.2,1); z-index:50; max-height:78vh; display:flex; flex-direction:column; padding-bottom:env(safe-area-inset-bottom); }
+  .drawer.open { transform:translateY(0); }
+  .drawer-grip { width:38px; height:4px; border-radius:2px; background:var(--line); margin:8px auto 0; }
+  .drawer-head { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
+  .drawer-head .src { font-family:var(--mono); font-size:13px; font-weight:500; color:var(--accent-ink); background:var(--accent-wash); padding:3px 9px; border-radius:6px; }
+  .drawer-head .ttl { font-family:var(--serif); font-size:16px; font-weight:500; }
+  .drawer-close { margin-left:auto; background:none; border:none; cursor:pointer; font-size:26px; color:var(--ink-soft); line-height:1; padding:2px 8px; min-height:40px; min-width:40px; }
+  .drawer-body { padding:16px 20px 24px; overflow-y:auto; font-size:14.5px; line-height:1.7; color:var(--ink); }
+  .drawer-body .passage { background:var(--paper); border-left:3px solid var(--accent); padding:12px 15px; border-radius:0 8px 8px 0; font-family:var(--serif); color:#2A2E36; }
+  .drawer-head .src-count { font-family:var(--mono); font-size:12px; color:var(--ink-soft); }
+  .src-chunk { margin-bottom:22px; }
+  .src-chunk-head { position:sticky; top:0; background:var(--card); font-family:var(--mono); font-size:12.5px; font-weight:600; color:var(--accent-ink); padding:6px 0 6px; margin-bottom:6px; border-bottom:1px solid var(--line); z-index:1; }
+  .src-chunk-head.active { color:var(--accent); }
+  .drawer-note { margin-top:14px; font-size:12px; color:var(--ink-soft); line-height:1.5; }
+
+  @media (min-width:640px) {
+    .header { padding:20px 26px 16px; }
+    .logo { font-size:26px; } .tagline { font-size:13px; }
+    .corpus-note { display:inline; font-size:11px; }
+    .messages { padding:26px; gap:22px; }
+    .bubble { max-width:88%; }
+    .composer { padding:16px 20px 20px; }
+  }
+
+  /* login gate */
+  .auth-screen { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:40px 24px; background:var(--bg); }
+  .auth-card { max-width:400px; }
+  .auth-logo { font-family:var(--serif); font-size:38px; font-weight:600; color:var(--ink); margin-bottom:8px; }
+  .auth-logo .accent { color:var(--accent); }
+  .auth-sub { color:var(--ink-soft); font-size:15px; line-height:1.55; margin-bottom:32px; }
+  .gbtn { display:inline-flex; align-items:center; gap:12px; padding:12px 22px; border:1px solid var(--line); border-radius:10px; background:#fff; font-size:15px; font-weight:500; color:#3c4043; cursor:pointer; transition:box-shadow .15s, background .15s; }
+  .gbtn:hover { box-shadow:0 1px 6px rgba(0,0,0,0.12); background:#fafafa; }
+  .gbtn svg { width:19px; height:19px; }
+  .auth-fine { margin-top:26px; font-size:12px; color:var(--ink-soft); }
+  .signout { background:none; border:1px solid var(--line); border-radius:8px; padding:5px 11px; font-size:12px; color:var(--ink-soft); cursor:pointer; font-family:var(--mono); }
+  .signout:hover { background:var(--paper); }
+  .user-chip { display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Supabase JS (UMD build) — loads via script tag, no build step needed -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <script type="text/babel">
+  const { useState, useRef, useEffect } = React;
+
+  /* ============ SUPABASE AUTH ============ */
+  const SUPABASE_URL = "https://vyzswjwejtsurpvmizzb.supabase.co";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_RdKQNcrYrL8uNgR7_rKqbA_jSdBrGo2";
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+
+  /* ============ REAL BACKEND (POST /chat, same-origin) ============ */
+  // one stable session id per browser tab, so follow-up questions keep context
+  const SESSION_ID = "sess-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+  async function mockApi(message, mode = "grounded") {
+    try {
+      // attach the logged-in user's access token so the backend knows who's asking
+      const { data: { session } } = await sb.auth.getSession();
+      const token = session ? session.access_token : "";
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token,
+        },
+        body: JSON.stringify({ message, session_id: SESSION_ID, mode }),
+      });
+      if (res.status === 401) {
+        return { grounded:false, citations:[],
+          answer: "⚠ Your session has expired. Please sign in again." };
+      }
+      if (!res.ok) {
+        return { grounded:false, citations:[],
+          answer: "⚠ The server returned an error (" + res.status + "). Please try again in a moment." };
+      }
+      const data = await res.json();
+      return {
+        grounded: !!data.grounded,
+        citations: Array.isArray(data.citations) ? data.citations : [],
+        answer: data.answer || "",
+      };
+    } catch (e) {
+      return { grounded:false, citations:[],
+        answer: "⚠ Couldn't reach the server. Check your connection and try again." };
+    }
+  }
+
+  /* ---- citation parsing ---- */
+  function splitIntoParts(text) {
+    const re = /\[([a-z]+),?\s*p\.?\s*(\d+)\]/gi;
+    const parts=[]; let last=0,m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index>last) parts.push({type:"text", value:text.slice(last,m.index)});
+      parts.push({type:"cite", book:m[1].toLowerCase(), page:parseInt(m[2],10)});
+      last=m.index+m[0].length;
+    }
+    if (last<text.length) parts.push({type:"text", value:text.slice(last)});
+    return parts;
+  }
+  /* Light loading status: cycles honest stage labels on approximate timers
+     while the normal single /chat request runs. The stages genuinely happen
+     in this order server-side; the timing is approximate, not backend-tied. */
+  function LoadingStatus() {
+    const stages = ["Understanding your question…", "Searching the textbooks…", "Reading the sources…", "Writing the grounded answer…"];
+    const [i, setI] = useState(0);
+    useEffect(() => {
+      const stops = [900, 2200, 3800]; // cumulative ms to reach stage 1,2,3
+      const timers = stops.map((t, idx) => setTimeout(() => setI(idx + 1), t));
+      return () => timers.forEach(clearTimeout);
+    }, []);
+    return (
+      <div className="load-status">
+        <span className="dot" />
+        <span className="label">{stages[i]}</span>
+      </div>
+    );
+  }
+
+  function renderInline(line, citations, onCite) {
+    return line.split(/(\*\*[^*]+\*\*)/g).map((seg, si) => {
+      if (seg.startsWith("**") && seg.endsWith("**")) return <strong key={si}>{seg.slice(2,-2)}</strong>;
+      return splitIntoParts(seg).map((p, pi) => {
+        if (p.type==="text") return <span key={si+"-"+pi}>{p.value}</span>;
+        const match = citations.find(c => c.book===p.book && c.page===p.page);
+        const label = p.book.charAt(0).toUpperCase()+p.book.slice(1)+" "+p.page;
+        return <span key={si+"-"+pi} className="cite" onClick={() => onCite({ all: citations, tapped: {book:p.book, page:p.page}, fallback: !match })}>{label}</span>;
+      });
+    });
+  }
+  // is this line part of a markdown table?
+  function isTableRow(line){ return line.trim().startsWith("|") && line.includes("|", 1); }
+  function isSeparatorRow(line){ return /^\s*\|?[\s:|-]+\|?\s*$/.test(line) && line.includes("-"); }
+  function parseRow(line){ return line.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c=>c.trim()); }
+
+  function AnswerBody({ text, citations, onCite }) {
+    const lines = text.split("\n"); const blocks=[]; let buf=[]; let i=0;
+    const flush = (k)=>{ if(buf.length){ blocks.push(<ul key={"ul"+k}>{buf}</ul>); buf=[]; } };
+
+    while (i < lines.length) {
+      const line = lines[i];
+      // table block?
+      if (isTableRow(line)) {
+        flush("t"+i);
+        const tableLines=[];
+        while (i < lines.length && isTableRow(lines[i])) { tableLines.push(lines[i]); i++; }
+        // first row = header, drop separator rows, rest = body
+        const rows = tableLines.filter(l => !isSeparatorRow(l)).map(parseRow);
+        if (rows.length) {
+          const header = rows[0]; const body = rows.slice(1);
+          blocks.push(
+            <div className="ans-table-wrap" key={"tbl"+i}>
+              <table className="ans-table">
+                <thead><tr>{header.map((h,hi)=><th key={hi}>{renderInline(h,citations,onCite)}</th>)}</tr></thead>
+                <tbody>{body.map((r,ri)=><tr key={ri}>{r.map((c,ci)=><td key={ci}>{renderInline(c,citations,onCite)}</td>)}</tr>)}</tbody>
+              </table>
+            </div>
+          );
+        }
+        continue;
+      }
+      const h = line.match(/^(#{1,6})\s+(.*)$/);   // #, ##, ### ... all levels
+      if (h) { flush(i); blocks.push(<h3 key={i}>{renderInline(h[2], citations, onCite)}</h3>); }
+      else if (line.startsWith("- ") || line.startsWith("* ")) { buf.push(<li key={i}>{renderInline(line.slice(2), citations, onCite)}</li>); }
+      else if (line.trim() === "") { flush(i); }
+      else { flush(i); blocks.push(<p key={i}>{renderInline(line, citations, onCite)}</p>); }
+      i++;
+    }
+    flush("end");
+    return <div>{blocks}</div>;
+  }
+
+  /* ============ COPY: build HTML + plain-text versions, write both ============ */
+  // plain text: fully clean prose. NO citations, NO markdown symbols.
+  function toPlainText(text) {
+    const lines = text.split("\n"); const out=[]; let i=0;
+    const dropCite = (s)=> s.replace(/\s*\[[a-z]+,?\s*p\.?\s*\d+(?:\s*[;,]\s*(?:[a-z]+,?\s*)?p\.?\s*\d+)*\]/gi, "");
+    const strip = (s)=> dropCite(s)
+      .replace(/\*\*(.*?)\*\*/g,"$1")   // **bold** -> bold
+      .replace(/\*(.*?)\*/g,"$1")       // *italic* -> italic
+      .replace(/`([^`]+)`/g,"$1")       // `code` -> code
+      .replace(/#{1,6}\s*/g,"")         // any hashes
+      .replace(/\*/g,"")                // any leftover asterisks
+      .replace(/[ \t]{2,}/g," ")        // tidy double spaces left by removed cites
+      .trim();
+    while (i<lines.length) {
+      const line=lines[i];
+      if (isTableRow(line)) {
+        const tl=[]; while(i<lines.length && isTableRow(lines[i])){ tl.push(lines[i]); i++; }
+        const rows = tl.filter(l=>!isSeparatorRow(l)).map(parseRow).map(r=>r.map(strip));
+        const cols = rows[0]?.length || 0;
+        const w = Array(cols).fill(0);
+        rows.forEach(r=>r.forEach((c,ci)=>{ w[ci]=Math.max(w[ci], c.length); }));
+        rows.forEach((r,ri)=>{
+          out.push(r.map((c,ci)=>c.padEnd(w[ci])).join("   "));
+        });
+        out.push("");
+        continue;
+      }
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
+      if (h) out.push("\n"+strip(h[2]));            // heading -> plain line, blank line before
+      else if (line.startsWith("- ") || line.startsWith("* ")) out.push("• "+strip(line.slice(2)));
+      else { const s = strip(line); if (s) out.push(s); }
+      i++;
+    }
+    return out.join("\n").replace(/\n{3,}/g,"\n\n").trim();
+  }
+  // html: clean rich text. NO citations. Headings in BOLD. Real tables.
+  function toHtml(text) {
+    const esc = (s)=> s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const dropCite = (s)=> s.replace(/\s*\[[a-z]+,?\s*p\.?\s*\d+(?:\s*[;,]\s*(?:[a-z]+,?\s*)?p\.?\s*\d+)*\]/gi, "");
+    const inline = (s)=> dropCite(esc(s))
+      .replace(/\*\*(.*?)\*\*/g,"<b>$1</b>")
+      .replace(/\*(.*?)\*/g,"$1")
+      .replace(/`([^`]+)`/g,"$1")
+      .trim();
+    const lines=text.split("\n"); const out=[]; let i=0; let inList=false;
+    const closeList=()=>{ if(inList){ out.push("</ul>"); inList=false; } };
+    while(i<lines.length){
+      const line=lines[i];
+      if (isTableRow(line)) {
+        closeList();
+        const tl=[]; while(i<lines.length && isTableRow(lines[i])){ tl.push(lines[i]); i++; }
+        const rows = tl.filter(l=>!isSeparatorRow(l)).map(parseRow);
+        out.push('<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse">');
+        rows.forEach((r,ri)=>{
+          const tag = ri===0 ? "th":"td";
+          out.push("<tr>"+r.map(c=>"<"+tag+">"+inline(c)+"</"+tag+">").join("")+"</tr>");
+        });
+        out.push("</table>");
+        continue;
+      }
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
+      if (h) { closeList(); out.push("<p><b>"+inline(h[2])+"</b></p>"); }
+      else if (line.startsWith("- ") || line.startsWith("* ")) { if(!inList){ out.push("<ul>"); inList=true; } out.push("<li>"+inline(line.slice(2))+"</li>"); }
+      else if (line.trim()==="") { closeList(); }
+      else { closeList(); const s=inline(line); if(s) out.push("<p>"+s+"</p>"); }
+      i++;
+    }
+    closeList();
+    return out.join("");
+  }
+  async function copyAnswer(text, setDone) {
+    const plain = toPlainText(text);
+    const html  = toHtml(text);
+    let ok = false;
+    // 1) best: rich clipboard (both formats) — needs https or localhost
+    try {
+      if (navigator.clipboard && window.ClipboardItem) {
+        const item = new ClipboardItem({
+          "text/html": new Blob([html], { type:"text/html" }),
+          "text/plain": new Blob([plain], { type:"text/plain" }),
+        });
+        await navigator.clipboard.write([item]);
+        ok = true;
+      }
+    } catch (e) { /* fall through */ }
+    // 2) plain-text clipboard API
+    if (!ok) {
+      try { await navigator.clipboard.writeText(plain); ok = true; } catch (e) {}
+    }
+    // 3) legacy fallback that works even on file:// (plain text only)
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = plain;
+        ta.style.position = "fixed"; ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (e) {}
+    }
+    setDone(ok ? true : "fail");
+    setTimeout(() => setDone(false), 1800);
+  }
+
+  function CopyButton({ text }) {
+    const [done, setDone] = useState(false);
+    const label = done === "fail" ? "Copy blocked — open via http" : (done ? "✓ Copied" : "⧉ Copy");
+    return (
+      <button className={"copy-btn " + (done === true ? "done" : "")} onClick={() => copyAnswer(text, setDone)}>
+        {label}
+      </button>
+    );
+  }
+
+  /* ============ MAIN APP ============ */
+  function App({ user }) {
+    const [messages, setMessages] = useState([]);
+    const [input, setInput] = useState("");
+    const [loading, setLoading] = useState(false);
+    const [moreLoading, setMoreLoading] = useState(null);
+    const [drawer, setDrawer] = useState(null);
+    const scrollRef = useRef(null);
+
+    useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
+
+    async function send(text) {
+      const q = (text ?? input).trim();
+      if (!q || loading) return;
+      setInput("");
+      setMessages(prev => [...prev, { role:"user", text:q }]);
+      setLoading(true);
+      const res = await mockApi(q, "grounded");
+      setLoading(false);
+      setMessages(prev => [...prev, { role:"bot", text:res.answer, citations:res.citations, grounded:res.grounded, question:q }]);
+    }
+    async function getGeneral(msgIndex, question) {
+      setMoreLoading(msgIndex);
+      const res = await mockApi(question, "general");
+      setMoreLoading(null);
+      setMessages(prev => {
+        const copy=[...prev];
+        copy.splice(msgIndex+1,0,{ role:"bot", text:res.answer, citations:[], grounded:false, isGeneral:true });
+        copy[msgIndex]={ ...copy[msgIndex], gotGeneral:true };
+        return copy;
+      });
+    }
+
+    const examples = [
+      "What is the interpretation of the Weber and Rinne tuning fork tests?",
+      "How do you differentiate a vestibular schwannoma from a meningioma at the cerebellopontine angle?",
+      "What is the House-Brackmann grading of facial nerve function?",
+    ];
+
+    return (
+      <div className="app">
+        <div className="header">
+          <span className="logo">Rhino<span className="accent">Bot</span></span>
+          <span className="tagline">ENT reference, grounded in the standard texts</span>
+          <span className="corpus-note">Cummings · Scott-Brown · Stell &amp; Maran · Shambaugh</span>
+          <span className="user-chip" style={{marginLeft:"auto"}}>
+            {user && user.email}
+            <button className="signout" onClick={() => sb.auth.signOut()}>Sign out</button>
+          </span>
+        </div>
+
+        <div className="messages" ref={scrollRef}>
+          {messages.length === 0 && !loading && (
+            <div className="welcome">
+              <h2>Ask an ENT question.</h2>
+              <p>Every answer is drawn from standard textbooks. Tap any citation to read the exact source passage.</p>
+              <div className="examples">
+                {examples.map((ex, i) => (<button key={i} className="example-chip" onClick={() => send(ex)}>{ex}</button>))}
+              </div>
+            </div>
+          )}
+
+          {messages.map((m, i) => (
+            <div key={i} className={"msg " + m.role}>
+              <div className="bubble">
+                {m.role === "bot" && (
+                  <div className={"badge " + (m.grounded ? "grounded" : "general")}>
+                    {m.grounded ? "§ From textbooks" : "⚠ General knowledge"}
+                  </div>
+                )}
+                {m.role === "bot" && !m.grounded && (
+                  <div className="warn-note">Not from the indexed textbooks. Verify against a primary source before relying on this.</div>
+                )}
+
+                {m.role === "bot"
+                  ? <AnswerBody text={m.text} citations={m.citations || []} onCite={setDrawer} />
+                  : m.text}
+
+                {m.role === "bot" && (
+                  <div className="actions">
+                    <CopyButton text={m.text} />
+                    {m.grounded && !m.gotGeneral && (
+                      <button className="more-btn" disabled={moreLoading === i} onClick={() => getGeneral(i, m.question)}>
+                        {moreLoading === i ? "Fetching…" : "⚠ Beyond textbooks"}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+
+          {loading && (<div className="msg bot"><div className="bubble"><LoadingStatus /></div></div>)}
+        </div>
+
+        <div className="composer">
+          <textarea value={input} rows={1}
+            placeholder="Type your query…"
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+          <button className="send-btn" onClick={() => send()} disabled={loading || !input.trim()}>Ask</button>
+        </div>
+
+        <div className={"drawer-scrim " + (drawer ? "open" : "")} onClick={() => setDrawer(null)} />
+        <div className={"drawer " + (drawer ? "open" : "")}>
+          <div className="drawer-grip" />
+          {drawer && <SourceStack drawer={drawer} onClose={() => setDrawer(null)} />}
+        </div>
+      </div>
+    );
+  }
+
+  /* Scrollable stack of every cited source for one answer, headed by book+page,
+     deduped, opening scrolled to the tapped chunk (after render, not mid-slide). */
+  /* Cosmetic-only: if a source passage ends mid-sentence (the real chunk
+     boundary), trim the dangling fragment back to the last complete sentence
+     and mark it so the reader knows the book continues. Display only — the
+     underlying retrieved chunk is untouched. */
+  function tidyPassageEnd(text) {
+    if (!text) return text;
+    const s = text.trimEnd();
+    // already ends on sentence-final punctuation (allow a trailing quote/paren)
+    if (/[.!?][")']?$/.test(s)) return s;
+    // find the last sentence-ending punctuation in the passage
+    let cut = -1;
+    for (let i = s.length - 1; i >= 0; i--) {
+      if (s[i] === "." || s[i] === "!" || s[i] === "?") { cut = i; break; }
+    }
+    // no complete sentence to fall back to -> leave as-is, just mark continuation
+    if (cut < 0) return s + " … (passage continues)";
+    return s.slice(0, cut + 1) + " … (passage continues)";
+  }
+
+  function SourceStack({ drawer, onClose }) {
+    const bodyRef = useRef(null);
+    const itemRefs = useRef({});
+
+    // dedupe citations by book+page, preserving answer order
+    const seen = {};
+    const items = [];
+    (drawer.all || []).forEach(c => {
+      const key = c.book + "|" + c.page;
+      if (!seen[key]) { seen[key] = true; items.push(c); }
+    });
+    // if the tapped chip had no backing chunk, make sure it still appears
+    const tappedKey = drawer.tapped.book + "|" + drawer.tapped.page;
+    if (!seen[tappedKey]) {
+      items.unshift({ book: drawer.tapped.book, page: drawer.tapped.page, chunk_text: null });
+    }
+
+    // jump to the tapped chunk AFTER the panel has rendered and finished sliding
+    useEffect(() => {
+      const t = setTimeout(() => {
+        const el = itemRefs.current[tappedKey];
+        const body = bodyRef.current;
+        if (el && body) body.scrollTop = el.offsetTop - body.offsetTop - 8;
+      }, 300); // waits out the .26s drawer slide before measuring
+      return () => clearTimeout(t);
+    }, [tappedKey]);
+
+    return (
+      <>
+        <div className="drawer-head">
+          <span className="ttl">Source passages</span>
+          <span className="src-count">{items.length} cited</span>
+          <button className="drawer-close" onClick={onClose}>×</button>
+        </div>
+        <div className="drawer-body" ref={bodyRef}>
+          {items.map((c, idx) => {
+            const key = c.book + "|" + c.page;
+            const heading = c.book.charAt(0).toUpperCase()+c.book.slice(1)+" · p."+c.page;
+            return (
+              <div key={key} className="src-chunk" ref={el => { if (el) itemRefs.current[key] = el; }}>
+                <div className={"src-chunk-head" + (key===tappedKey ? " active" : "")}>{heading}</div>
+                {c.chunk_text
+                  ? <div className="passage">{tidyPassageEnd(c.chunk_text)}</div>
+                  : <div className="passage">The exact passage isn't loaded for {heading}.</div>}
+              </div>
+            );
+          })}
+          <div className="drawer-note">These are the retrieved textbook passages the answer was grounded in. Compare each against the claim to verify.</div>
+        </div>
+      </>
+    );
+  }
+
+  /* ---- Login screen (hard gate) ---- */
+  function LoginScreen() {
+    const [busy, setBusy] = useState(false);
+    async function signIn() {
+      setBusy(true);
+      const { error } = await sb.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin },
+      });
+      if (error) { setBusy(false); alert("Sign-in failed: " + error.message); }
+      // on success the browser redirects to Google, so no further code runs here
+    }
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <div className="auth-logo">Rhino<span className="accent">Bot</span></div>
+          <div className="auth-sub">
+            An ENT reference grounded in the standard textbooks, with every answer
+            traceable to its source page. Sign in to continue.
+          </div>
+          <button className="gbtn" onClick={signIn} disabled={busy}>
+            <svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+              <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.2 0 24 0 14.6 0 6.4 5.4 2.5 13.3l7.8 6.1C12.2 13.2 17.6 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9.1h12.4c-.5 2.9-2.1 5.4-4.6 7.1l7.1 5.5c4.2-3.9 6.6-9.6 6.6-16.1z"/>
+              <path fill="#FBBC05" d="M10.3 28.6c-.5-1.4-.8-2.9-.8-4.6s.3-3.2.8-4.6l-7.8-6.1C.9 16.5 0 20.1 0 24s.9 7.5 2.5 10.7l7.8-6.1z"/>
+              <path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.1-5.5c-2 1.4-4.6 2.2-8.1 2.2-6.4 0-11.8-3.7-13.7-9.9l-7.8 6.1C6.4 42.6 14.6 48 24 48z"/>
+            </svg>
+            {busy ? "Redirecting…" : "Sign in with Google"}
+          </button>
+          <div className="auth-fine">Access is limited to invited users.</div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- Gate: show the app only when signed in ---- */
+  function AuthGate() {
+    const [session, setSession] = useState(undefined); // undefined = still loading
+    useEffect(() => {
+      sb.auth.getSession().then(({ data }) => setSession(data.session));
+      const { data: sub } = sb.auth.onAuthStateChange((_e, s) => setSession(s));
+      return () => sub.subscription.unsubscribe();
+    }, []);
+    if (session === undefined) {
+      return <div className="auth-screen"><div className="auth-sub">Loading…</div></div>;
+    }
+    if (!session) return <LoginScreen />;
+    return <App user={session.user} />;
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<AuthGate />);
+
+  // Register the (network-only) service worker so the app is installable as a PWA.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    });
+  }
+  </script>
+</body>
+</html>

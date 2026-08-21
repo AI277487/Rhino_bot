@@ -72,7 +72,7 @@ except Exception as e:
     print(f"[supabase: init failed, logging OFF — {e}]")
 
 
-def log_query(question, answer, grounded, usage=None):
+def log_query(question, answer, grounded):
     """
     Write one question/answer to the query_logs table. Best-effort only:
     logging must NEVER break answering, so any failure is swallowed. The user
@@ -80,19 +80,15 @@ def log_query(question, answer, grounded, usage=None):
     """
     if _supabase is None:
         return
-    row = {"question": question, "answer": answer, "grounded": grounded}
-    if usage:
-        row.update({
-            "input_tokens":   usage["input_tokens"],
-            "output_tokens":  usage["output_tokens"],
-            "total_tokens":   usage["total_tokens"],
-            "cost_usd":       usage["cost_usd"],
-            "cost_breakdown": usage["cost_breakdown"],
-        })
     try:
-        _supabase.table("query_logs").insert(row).execute()
+        _supabase.table("query_logs").insert({
+            "question": question,
+            "answer": answer,
+            "grounded": grounded,
+        }).execute()
     except Exception as e:
         print(f"[supabase log failed (ignored): {e}]")
+
 
 class ChatIn(BaseModel):
     message: str
@@ -104,6 +100,11 @@ class ChatIn(BaseModel):
 @app.get("/")
 def index():
     return FileResponse(_INDEX)
+
+
+@app.get("/privacy")
+def privacy():
+    return FileResponse(os.path.join(_HERE, "privacy.html"))
 
 
 # --- PWA static files (served from the same folder as the HTML) ---
@@ -139,15 +140,14 @@ def chat(body: ChatIn):
         return {"answer": "Please enter a question.", "citations": [], "grounded": False}
 
     with _lock:
-        query.reset_usage()
         if body.mode == "general":
             # the frontend's "get general answer" button
             text = query.sonnet_fallback(msg)
-            log_query(msg, text, False, query.pop_usage())
+            log_query(msg, text, False)
             return {"answer": text, "citations": [], "grounded": False}
 
         reply, citations, grounded = query.answer(msg, user_id=body.session_id)
-        log_query(msg, reply, grounded, query.pop_usage())
+        log_query(msg, reply, grounded)
         return {"answer": reply, "citations": citations, "grounded": grounded}
 
 
