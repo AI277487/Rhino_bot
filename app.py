@@ -31,6 +31,36 @@ _ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "").strip()
 
 _lock = threading.Lock()
 
+# --- Layer 3: per-user lifetime query cap ---------------------------------
+# Free users get FREE_LIMIT answered queries, lifetime (no reset). The two
+# emails in UNLIMITED bypass the cap entirely. Compared lowercased because
+# Google can return mixed-case emails.
+FREE_LIMIT = 15
+UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
+
+_BLOCK_MESSAGE = (
+    "You've used all 15 of your questions for now. "
+    "RhinoBot is still in early access, so we're handling additional access "
+    "personally. Email support.artai@gmail.com with \"upgrade\" in your "
+    "message and we'll set you up."
+)
+
+
+def count_user_queries(email):
+    """Count this user's lifetime rows in query_logs. On any DB error, return
+    None so the caller can FAIL OPEN (a database blip must not lock users out)."""
+    if _supabase is None or not email:
+        return None
+    try:
+        res = (_supabase.table("query_logs")
+               .select("id", count="exact")
+               .eq("user_email", email)
+               .execute())
+        return res.count
+    except Exception as e:
+        print(f"[cap count failed, failing open: {e}]")
+        return None
+
 # --- Supabase query logging (Layer 1) -------------------------------------
 _supabase = None
 try:
@@ -133,6 +163,14 @@ def chat(body: ChatIn, request: Request):
     user_email = getattr(user, "email", None)
     _meta = getattr(user, "user_metadata", None) or {}
     user_name = _meta.get("full_name") or _meta.get("name") or None
+
+    # --- Cap gate: checked BEFORE any retrieval/model call, so a blocked
+    # request costs nothing. Unlimited emails skip it. On DB error we fail
+    # open (count is None) rather than lock the user out.
+    if user_email and user_email.lower() not in UNLIMITED:
+        used = count_user_queries(user_email)
+        if used is not None and used >= FREE_LIMIT:
+            return {"answer": _BLOCK_MESSAGE, "citations": [], "grounded": False}
 
     msg = (body.message or "").strip()
     if not msg:
