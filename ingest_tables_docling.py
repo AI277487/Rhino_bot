@@ -14,26 +14,46 @@ TABLE RETRIEVAL FIX (Bug B):
   document and the embedded text are allowed to differ.
 
 Also baked in: long-block chunking (MiniLM truncates at 256 tokens),
-sub-3-char noise skipped, `index + reference-list blocks dropped.
+sub-15-char noise skipped, index + reference-list blocks dropped.
+
+DOCLING TABLES (cummings):
+  Docling emits two caption shapes — an explicit `caption` field ("TABLE 1.3
+  ...") for some tables, and null for others where the caption is baked into
+  markdown row 1. table_caption() takes the explicit field when present and
+  normalizes BOTH through the same stripper. A small drop filter removes the
+  two non-content shapes Docling misread as tables: stray "Fig. N" lines and
+  the book's video-contents lists. BOX callouts are KEPT.
+
+RESUMABLE INGEST:
+  Embedding 50k+ docs on a CPU-only laptop can exhaust RAM and segfault.
+  This ingest checkpoints each batch to a progress file and can resume after
+  a crash. upsert() (not add()) makes re-running an overlapping batch safe.
+  The "already ingested" guard is resume-aware: it only blocks when the
+  source is present AND there is no in-progress checkpoint file.
 """
 
+import os
 import json
 import re
+import gc
 import chromadb
+from is_nav_table import is_nav_table
 from sentence_transformers import SentenceTransformer
 
 # ---- per-book settings: change these 3 for each new book, then re-run --------
-SOURCE      = "scott_brown"
-BLOCKS_FILE = "9thScottBrownsOtorhinolaryngology.blocks.clean.jsonl"
-TABLES_FILE = "tables.jsonl"
+SOURCE      = "shaumbaugh"
+BLOCKS_FILE = "shaumbaugh.blocks.jsonl"
+TABLES_FILE = "shaumbaugh.tables.jsonl"
 # -----------------------------------------------------------------------------
 DB_PATH     = "chroma_db"
 COLLECTION  = "medical_library"      # shared across all books; MUST match query.py
-BATCH       = 500
-MIN_CHARS   = 3
+BATCH       = 128
+MIN_CHARS   = 15
 OVERLAP     = 32
-DROP_INDEX  = True 
+DROP_INDEX  = True
 DROP_REFS   = True
+
+PROGRESS_FILE = f"ingest_progress_{SOURCE}.txt"
 
 model      = SentenceTransformer("all-MiniLM-L6-v2")
 tokenizer  = model.tokenizer
@@ -42,8 +62,12 @@ MAX_TOKENS = model.max_seq_length - 2
 client     = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_or_create_collection(name=COLLECTION)
 
-if collection.get(where={"source": SOURCE}, limit=1)["ids"]:
+# Guard: stop ONLY if the source is already present AND we're not mid-resume.
+# A progress file means a prior run crashed partway — allow it to continue.
+if (collection.get(where={"source": SOURCE}, limit=1)["ids"]
+        and not os.path.exists(PROGRESS_FILE)):
     print(f"Source '{SOURCE}' is already in '{COLLECTION}' — skipping.")
+    print(f"(To rebuild it: delete its rows and remove {PROGRESS_FILE} first.)")
     raise SystemExit
 
 
@@ -67,7 +91,7 @@ def is_running_header(text):
     True for running page-headers like '79: Granulomatous conditions of the nose 857'
     — chapter-number, colon, title, trailing page number. These repeat once per page
     across a whole chapter and, being short and topical, flood retrieval with noise
-    while carrying no real content. ~1,196 of them in this book.
+    while carrying no real content.
     """
     t = re.sub(r"\s+", " ", (text or "").strip())
     return len(t) < 90 and re.match(r"^\d+:\s+.+?\s+\d+$", t) is not None
@@ -100,15 +124,55 @@ def chunk_text(text):
 
 # --- table helpers (Bug B) ---------------------------------------------------
 
-def table_caption(md):
-    """Pull the human caption from a table's first markdown row, e.g.
-    '| TABLE 79.1 Granulomatous conditions... |' -> 'Granulomatous conditions...'."""
-    first = md.splitlines()[0] if md else ""
-    cells = [c.strip() for c in first.strip().strip("|").split("|")]
-    head  = next((c for c in cells if c), "")
+def table_caption(md, explicit=None):
+    """Return a clean, consistent caption for a table.
+
+    If Docling gave us an explicit caption field (e.g. 'TABLE 1.3 Examples of
+    Outcomes Measures...'), use it; otherwise parse it from the first markdown
+    row (the old pdfplumber / Scott-Brown convention). Either way the result is
+    normalized the SAME way — a leading 'TABLE N.N' is stripped — so captions
+    across every book are consistent. Non-TABLE heads (e.g. 'BOX 10.3 ...') are
+    returned intact.
+    """
+    if explicit:
+        head = explicit.strip()
+    else:
+        first = md.splitlines()[0] if md else ""
+        cells = [c.strip() for c in first.strip().strip("|").split("|")]
+        head  = next((c for c in cells if c), "")
     m = re.match(r"(?i)^table\s+[\d.]+\s+(.*)$", head)
     return (m.group(1).strip() if m else head).strip()
 
+
+def is_droppable_table(md, caption):
+    """True for the two non-content shapes Docling misread as tables:
+       (1) stray 'Fig. N ...' captions, and
+       (2) the book's video-contents lists (rows of 'NN.N  Title' with no
+           TABLE/BOX marker near the top).
+       BOX callouts and headerless real tables are KEPT."""
+    first_line = (md.splitlines()[0] if md else "").strip()
+
+    is_figure_caption = re.match(r"(?i)^fig\.?\s+\d", first_line) is not None
+
+    head_cells = [c.strip() for c in first_line.strip("|").split("|") if c.strip()]
+    first_cell = head_cells[0] if head_cells else ""
+    is_video_list = (re.match(r"^\d+\.\d+$", first_cell) is not None
+                     and "table" not in md[:200].lower()
+                     and "box"   not in md[:200].lower())
+
+    return is_figure_caption or is_video_list
+def is_junk_table(md, raw_caption):
+    """Drop pdfplumber misreads: section-divider pages ('SECTION 1: OTOLOGY')
+    and shattered-figure fragments ('K+', 'SL K+'). Junk = NO real 'TABLE X.Y'
+    caption AND almost no content. Any real captioned or content-bearing table
+    is kept. Pass the RAW caption r.get('caption'), not the stripped one."""
+    if raw_caption and re.match(r"(?i)^table\s+[\d.]+", raw_caption.strip()):
+        return False
+    first = (md.splitlines()[0] if md else "").strip().strip("|").strip()
+    if re.match(r"(?i)^table\s+[\d.]+", first):
+        return False
+    content_chars = len(re.sub(r"[|\-\s]", "", md or ""))
+    return content_chars < 60
 
 def flatten_table(md):
     """Pipe/dash markdown -> space-separated words, so real terms (not pipes)
@@ -131,6 +195,7 @@ def table_embed_text(md_piece, caption):
 # embeds = what we EMBED for search (caption-weighted for tables, == doc for prose)
 ids, docs, embeds, metas = [], [], [], []
 skipped = dropped_refs = chunked_blocks = 0
+dropped_tables = 0
 
 # --- blocks (prose): embed == stored text ---
 with open(BLOCKS_FILE, encoding="utf-8") as f:
@@ -165,6 +230,7 @@ with open(BLOCKS_FILE, encoding="utf-8") as f:
                 "block_index": r.get("block_index"),
                 "section": r.get("section"),
                 "is_heading": r.get("is_heading"),
+                "is_figure": r.get("is_figure"),
                 "chunk_index": k, "n_chunks": len(pieces),
             }))
 
@@ -172,11 +238,21 @@ with open(BLOCKS_FILE, encoding="utf-8") as f:
 with open(TABLES_FILE, encoding="utf-8") as f:
     for line in f:
         r = json.loads(line)
-        md = (r.get("markdown") or "").strip()
+        md = (r.get("markdown") or "").strip().replace("\x07", "")
         if len(md) < MIN_CHARS:
             skipped += 1
             continue
-        caption = table_caption(md)
+
+        caption = table_caption(md, explicit=r.get("caption"))
+
+        # drop only Docling's misreads (Fig. lines, video-contents lists);
+        # BOX callouts and headerless real tables are kept.
+        if (is_droppable_table(md, caption)
+                or is_junk_table(md, r.get("caption"))
+                or is_nav_table(md)):
+            dropped_tables += 1
+            continue
+
         pieces  = chunk_text(md)
         base = f"{SOURCE}_p{r['page']}_t{r['table_index']}"
         for k, piece in enumerate(pieces):
@@ -195,19 +271,49 @@ with open(TABLES_FILE, encoding="utf-8") as f:
 
 print(f"[{SOURCE}] prepared {len(docs)} documents "
       f"({skipped} noise skipped, {dropped_refs} references dropped, "
+      f"{dropped_tables} fig/video tables dropped, "
       f"{chunked_blocks} long blocks chunked).")
-print(f"Embedding + adding in batches of {BATCH}...")
 
-for start in range(0, len(docs), BATCH):
-    b_docs   = docs[start:start + BATCH]
-    b_embtxt = embeds[start:start + BATCH]
-    b_emb    = model.encode(b_embtxt, show_progress_bar=False).tolist()  # embed SEARCH text
-    collection.add(
-        ids=ids[start:start + BATCH],
-        documents=b_docs,                             # store DISPLAY text
-        embeddings=b_emb,
-        metadatas=metas[start:start + BATCH],
-    )
-    print(f"  added {min(start + BATCH, len(docs))}/{len(docs)}")
+# --- resumable embed + add -------------------------------------------------
+# load which batches already succeeded (survives a crash/restart)
+done_batches = set()
+if os.path.exists(PROGRESS_FILE):
+    with open(PROGRESS_FILE) as pf:
+        done_batches = {int(x) for x in pf.read().split() if x.strip()}
+    print(f"resuming: {len(done_batches)} batches already done")
+
+n_batches = (len(docs) + BATCH - 1) // BATCH
+print(f"Embedding + adding {len(docs)} docs in {n_batches} batches of {BATCH}...")
+
+for bi in range(n_batches):
+    if bi in done_batches:
+        continue
+    start = bi * BATCH
+    end   = min(start + BATCH, len(docs))
+
+    b_ids    = ids[start:end]
+    b_docs   = docs[start:end]
+    b_embtxt = embeds[start:end]
+    b_metas  = metas[start:end]
+
+    b_emb = model.encode(b_embtxt, show_progress_bar=False,
+                         batch_size=32).tolist()      # cap the model's own batching
+
+    # upsert (not add): re-running an overlapping batch just overwrites the
+    # same ids instead of raising a duplicate-id error — makes resume safe.
+    collection.upsert(ids=b_ids, documents=b_docs,
+                      embeddings=b_emb, metadatas=b_metas)
+
+    # checkpoint: record this batch as done (upsert happened first, so if we
+    # reach here the rows are in Chroma)
+    with open(PROGRESS_FILE, "a") as pf:
+        pf.write(f"{bi}\n")
+
+    if bi % 10 == 0 or end == len(docs):
+        print(f"  batch {bi + 1}/{n_batches}  ({end}/{len(docs)})")
+
+    del b_emb, b_docs, b_embtxt, b_metas, b_ids
+    gc.collect()
 
 print(f"Done. '{COLLECTION}' now holds {collection.count()} items total.")
+os.remove(PROGRESS_FILE)   # clean up on full success

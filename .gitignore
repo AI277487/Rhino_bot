@@ -1,10 +1,13 @@
 .env
 chroma_db/
+chroma_db.bak/
 venv/
 __pycache__/
 extracted/
 previews/
 without_escalation to sonnet/
+books data aafter extraction/
+python_files_from_claude/
 *.pdf
 *.jsonl
 *.txt
