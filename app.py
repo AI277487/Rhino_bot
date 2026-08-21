@@ -1,16 +1,5 @@
 """
 app.py — FastAPI wrapper around query.py for Rhino Bot.
-
-Serves:
-  GET  /       -> the single-file React frontend (rhino-bot-ui.html)
-  POST /chat   -> {message, session_id, mode} -> {answer, citations, grounded}
-
-Importing `query` runs its startup once (loads ChromaDB, builds the BM25
-index), so the first request after boot is fast. Run with:
-
-    uvicorn app:app --host 127.0.0.1 --port 8000
-
-and put HTTPS in front of it (see deploy notes).
 """
 
 import os
@@ -21,19 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-# Load .env from THIS file's own folder, by absolute path, BEFORE anything
-# reads an environment variable. systemd may run the app from a different
-# working directory, so a bare load_dotenv() can silently find nothing —
-# pinning the path is what makes SUPABASE_URL / SUPABASE_SERVICE_KEY reliable.
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-import query  # noqa: E402  (import triggers Chroma load + BM25 build, intentional)
+import query  # noqa: E402
 
 app = FastAPI(title="Rhino Bot API")
 
-# Same-origin in the demo (frontend served below), so CORS isn't strictly
-# needed — kept permissive in case you host the HTML elsewhere. Tighten for prod.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,20 +27,11 @@ app.add_middleware(
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _INDEX = os.path.join(_HERE, "rhino-bot-ui.html")
 
-# Shared demo password, read from .env (ACCESS_PASSWORD=...). If it's unset,
-# the gate is OFF (app answers freely) — so setting it in .env is what turns
-# protection on. Keep it out of the code so it's easy to rotate.
 _ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "").strip()
 
-# query.py uses module-global state (histories, embedder, BM25). FastAPI runs
-# sync endpoints in a threadpool, so serialize the pipeline to avoid two
-# requests racing on that shared state. Fine at demo concurrency; revisit if
-# you need real parallelism.
 _lock = threading.Lock()
 
 # --- Supabase query logging (Layer 1) -------------------------------------
-# Connect using the SERVER-ONLY secret key from .env. If either value is
-# missing, logging is silently disabled so the app still runs normally.
 _supabase = None
 try:
     _SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -65,36 +39,38 @@ try:
     if _SUPABASE_URL and _SUPABASE_KEY:
         from supabase import create_client
         _supabase = create_client(_SUPABASE_URL, _SUPABASE_KEY)
-        print("[supabase: connected — query logging ON]")
+        print("[supabase: connected - query logging ON]")
     else:
-        print("[supabase: not configured — query logging OFF]")
+        print("[supabase: not configured - query logging OFF]")
 except Exception as e:
-    print(f"[supabase: init failed, logging OFF — {e}]")
+    print(f"[supabase: init failed, logging OFF - {e}]")
 
 
-def log_query(question, answer, grounded, user_email=None, user_name=None):
+def log_query(question, answer, grounded, usage=None, user_email=None, user_name=None):
     if _supabase is None:
         return
     try:
-        _supabase.table("query_logs").insert({
+        row = {
             "question": question,
             "answer": answer,
             "grounded": grounded,
             "user_email": user_email,
             "user_name": user_name,
-        }).execute()
+        }
+        if usage:
+            row.update({
+                "input_tokens":   usage["input_tokens"],
+                "output_tokens":  usage["output_tokens"],
+                "total_tokens":   usage["total_tokens"],
+                "cost_usd":       usage["cost_usd"],
+                "cost_breakdown": usage["cost_breakdown"],
+            })
+        _supabase.table("query_logs").insert(row).execute()
     except Exception as e:
         print(f"[supabase log failed (ignored): {e}]")
 
 
 def verify_user(request):
-    """
-    Read the 'Authorization: Bearer <token>' header, ask Supabase whether the
-    token is genuine and unexpired, and return the user (with .id and .email)
-    if so — otherwise None. This is the server-side gate: no valid token, no
-    user, no answer. Uses Supabase's own validation, so we never trust the
-    token blindly.
-    """
     if _supabase is None:
         return None
     auth = request.headers.get("authorization", "")
@@ -104,7 +80,6 @@ def verify_user(request):
     if not token:
         return None
     try:
-        # ask Supabase to validate the token and tell us who it belongs to
         res = _supabase.auth.get_user(token)
         return res.user if res and res.user else None
     except Exception as e:
@@ -115,8 +90,8 @@ def verify_user(request):
 class ChatIn(BaseModel):
     message: str
     session_id: str = "default"
-    mode: str = "grounded"      # "grounded" (RAG) | "general" (Sonnet fallback)
-    passcode: str = ""          # shared demo password sent by the frontend
+    mode: str = "grounded"
+    passcode: str = ""
 
 
 @app.get("/")
@@ -129,7 +104,6 @@ def privacy():
     return FileResponse(os.path.join(_HERE, "privacy.html"))
 
 
-# --- PWA static files (served from the same folder as the HTML) ---
 _PWA_FILES = {
     "manifest.webmanifest": "application/manifest+json",
     "sw.js": "application/javascript",
@@ -148,10 +122,6 @@ def health():
 
 @app.post("/chat")
 def chat(body: ChatIn, request: Request):
-    # --- Auth gate: require a valid Supabase login token ---
-    # Checked BEFORE any retrieval or model call, so an unauthenticated
-    # request costs $0. This is the real server-side gate — the login screen
-    # on the frontend is not enough on its own.
     user = verify_user(request)
     if user is None:
         return JSONResponse(
@@ -159,7 +129,7 @@ def chat(body: ChatIn, request: Request):
             content={"answer": "Please sign in to use RhinoBot.",
                      "citations": [], "grounded": False},
         )
-    user_id = user.id  # stable per-user id, used for logging and (next) caps
+    user_id = user.id
     user_email = getattr(user, "email", None)
     _meta = getattr(user, "user_metadata", None) or {}
     user_name = _meta.get("full_name") or _meta.get("name") or None
@@ -169,18 +139,19 @@ def chat(body: ChatIn, request: Request):
         return {"answer": "Please enter a question.", "citations": [], "grounded": False}
 
     with _lock:
+        query.reset_usage()
         if body.mode == "general":
-            # the frontend's "get general answer" button
             text = query.sonnet_fallback(msg)
-            log_query(msg, text, False, user_email=user_email, user_name=user_name)
+            log_query(msg, text, False, usage=query.pop_usage(),
+                      user_email=user_email, user_name=user_name)
             return {"answer": text, "citations": [], "grounded": False}
 
         reply, citations, grounded = query.answer(msg, user_id=user_id)
-        log_query(msg, reply, grounded, user_email=user_email, user_name=user_name)
+        log_query(msg, reply, grounded, usage=query.pop_usage(),
+                  user_email=user_email, user_name=user_name)
         return {"answer": reply, "citations": citations, "grounded": grounded}
 
 
-# --- PWA asset catch-all: MUST be last so it never shadows /health or /chat ---
 @app.get("/{fname}")
 def pwa_asset(fname: str):
     if fname in _PWA_FILES:
