@@ -232,6 +232,30 @@
   .wr-link:hover{ text-decoration:underline; }
   .wr-date{ font-family:var(--mono,monospace); font-size:11px; color:var(--ink-soft,#545A66); margin-top:8px; }
   .wr-empty{ text-align:center; color:var(--ink-soft,#545A66); font-size:14px; padding:40px 20px; }
+
+  /* --- Account panel (hamburger) --- */
+  .ham-btn{ width:38px; height:38px; border:1px solid var(--line,#E6E3DC); border-radius:9px; background:var(--card,#fff); cursor:pointer; display:inline-flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; flex:none; margin-right:10px; }
+  .ham-btn:hover{ background:var(--accent-wash,#EAF1F0); border-color:var(--accent,#2C6E6A); }
+  .ham-btn span{ width:17px; height:2px; background:var(--ink,#1C1F26); border-radius:2px; }
+  .acct-scrim{ position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .22s; z-index:80; }
+  .acct-scrim.open{ opacity:1; pointer-events:auto; }
+  .acct-panel{ position:fixed; top:0; left:0; bottom:0; width:310px; max-width:86vw; background:var(--card,#fff); border-right:1px solid var(--line,#E6E3DC); transform:translateX(-100%); transition:transform .24s cubic-bezier(.4,0,.2,1); z-index:90; display:flex; flex-direction:column; box-shadow:2px 0 24px rgba(0,0,0,.06); }
+  .acct-panel.open{ transform:translateX(0); }
+  .acct-head{ padding:20px 18px; border-bottom:1px solid var(--line,#E6E3DC); background:linear-gradient(180deg,var(--accent-wash,#EAF1F0),transparent); }
+  .acct-avatar{ width:44px; height:44px; border-radius:50%; background:var(--accent,#2C6E6A); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:600; font-size:18px; font-family:var(--serif,Georgia); margin-bottom:12px; }
+  .acct-name{ font-family:var(--serif,Georgia); font-size:18px; font-weight:600; }
+  .acct-email{ font-family:var(--mono,monospace); font-size:12px; color:var(--ink-soft,#545A66); margin-top:3px; word-break:break-all; }
+  .acct-body{ padding:12px; flex:1; overflow-y:auto; }
+  .acct-btn{ width:100%; text-align:left; padding:12px 14px; border-radius:10px; border:1px solid var(--line,#E6E3DC); background:var(--card,#fff); cursor:pointer; font-family:inherit; font-size:14px; font-weight:500; color:var(--ink,#1C1F26); display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .acct-btn:hover{ background:var(--accent-wash,#EAF1F0); border-color:var(--accent,#2C6E6A); }
+  .acct-btn .ic{ color:var(--accent,#2C6E6A); }
+  .acct-foot{ padding:14px 18px; border-top:1px solid var(--line,#E6E3DC); }
+  .acct-signout{ font-family:var(--mono,monospace); font-size:12px; color:var(--ink-soft,#545A66); background:none; border:none; cursor:pointer; text-decoration:underline; }
+  .hist-item{ background:var(--card,#fff); border:1px solid var(--line,#E6E3DC); border-radius:12px; padding:12px 14px; cursor:pointer; margin-bottom:8px; }
+  .hist-item:hover{ border-color:var(--accent,#2C6E6A); background:var(--accent-wash,#EAF1F0); }
+  .hist-q{ font-size:14px; font-weight:500; }
+  .hist-meta{ font-family:var(--mono,monospace); font-size:11px; color:var(--ink-soft,#545A66); margin-top:4px; }
+  .hist-cites{ color:var(--accent,#2C6E6A); }
 </style>
 </head>
 <body>
@@ -517,6 +541,9 @@
     const [drawer, setDrawer] = useState(null);
     const [worthOpen, setWorthOpen] = useState(false);
     const [worthItems, setWorthItems] = useState(null);
+    const [acctOpen, setAcctOpen] = useState(false);
+    const [histView, setHistView] = useState(false);
+    const [histItems, setHistItems] = useState(null);
     const scrollRef = useRef(null);
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
@@ -531,6 +558,27 @@
         const data = res.ok ? await res.json() : { items: [] };
         setWorthItems(data.items || []);
       } catch (e) { setWorthItems([]); }
+    }
+
+    async function openHistory() {
+      setHistView(true);
+      if (histItems !== null) return;
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        const token = session ? session.access_token : "";
+        const res = await fetch("/history", { headers: { "Authorization": "Bearer " + token } });
+        const data = res.ok ? await res.json() : { turns: [] };
+        setHistItems(data.turns || []);
+      } catch (e) { setHistItems([]); }
+    }
+    function reopenTurn(turn) {
+      // rebuild the exact message shape AnswerBody expects, from the stored row
+      setMessages([
+        { role:"user", text: turn.question },
+        { role:"bot", text: turn.answer, citations: turn.citations || [], grounded: !!turn.grounded, question: turn.question },
+      ]);
+      setAcctOpen(false);
+      setHistView(false);
     }
 
     async function send(text) {
@@ -564,6 +612,7 @@
     return (
       <div className="app">
         <div className="header">
+          <button className="ham-btn" onClick={() => { setAcctOpen(true); setHistView(false); }} aria-label="Menu"><span></span><span></span><span></span></button>
           <span className="logo">Rhino<span className="accent">Bot</span></span>
           <span className="tagline">ENT reference, grounded in the standard texts</span>
           <span className="corpus-note">Cummings · Scott-Brown · Stell &amp; Maran · Shambaugh</span>
@@ -643,6 +692,38 @@
           </div>
           <div className="wr-body-wrap">
             <WorthReadList items={worthItems} />
+          </div>
+        </aside>
+
+        <div className={"acct-scrim" + (acctOpen ? " open" : "")} onClick={() => setAcctOpen(false)}></div>
+        <aside className={"acct-panel" + (acctOpen ? " open" : "")} aria-label="Account">
+          <div className="acct-head">
+            <div className="acct-avatar">{(user && (user.user_metadata && user.user_metadata.full_name || user.email) || "?").trim().charAt(0).toUpperCase()}</div>
+            <div className="acct-name">{user && user.user_metadata && user.user_metadata.full_name || "Signed in"}</div>
+            <div className="acct-email">{user && user.email}</div>
+          </div>
+          <div className="acct-body">
+            {!histView ? (
+              <React.Fragment>
+                <button className="acct-btn" onClick={openHistory}><span className="ic">◷</span> Chat history</button>
+                <button className="acct-btn" onClick={() => { setMessages([]); setAcctOpen(false); }}><span className="ic">＋</span> New chat</button>
+              </React.Fragment>
+            ) : (
+              <React.Fragment>
+                <button className="acct-btn" style={{marginBottom:"12px"}} onClick={() => setHistView(false)}><span className="ic">←</span> Back</button>
+                {histItems === null && <div className="hist-meta" style={{textAlign:"center",padding:"20px"}}>Loading…</div>}
+                {histItems !== null && histItems.length === 0 && <div className="hist-meta" style={{textAlign:"center",padding:"20px"}}>No history yet.</div>}
+                {histItems !== null && histItems.map((t) => (
+                  <div key={t.id} className="hist-item" onClick={() => reopenTurn(t)}>
+                    <div className="hist-q">{t.question}</div>
+                    <div className="hist-meta">{new Date(t.created_at).toLocaleDateString(undefined,{day:"numeric",month:"short"})} · <span className="hist-cites">{(t.citations && t.citations.length) || 0} sources</span></div>
+                  </div>
+                ))}
+              </React.Fragment>
+            )}
+          </div>
+          <div className="acct-foot">
+            <button className="acct-signout" onClick={() => sb.auth.signOut()}>Sign out</button>
           </div>
         </aside>
       </div>
