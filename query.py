@@ -772,7 +772,7 @@ def answer(query, user_id="default"):
         history.append(f"Assistant: {reply}")
         if len(history) > 20:
             del history[:-20]
-        return reply, [], False
+        return reply, [], False, search_query
     prompt= f"""You are answering a medical question using retrieved textbook excerpts.
 
 The context below contains excerpts from one or more ENT textbooks. Your job is to
@@ -841,7 +841,7 @@ Question: {search_query}"""
     if len(history) > 20:
         del history[:-20]
 
-    return reply, citations, grounded
+    return reply, citations, grounded, search_query
 
 
 if __name__ == "__main__":
