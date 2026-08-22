@@ -152,6 +152,33 @@ def health():
     return {"ok": True, "chunks": query.collection.count()}
 
 
+@app.get("/worth_read")
+def worth_read(request: Request):
+    """
+    Return the curated Worth Read items (guidelines + notable answers), newest
+    first, for the right-side panel. Auth-gated like the rest of the app so only
+    signed-in users see it. Only rows with active=true are returned, so an item
+    can be hidden by flipping active without deleting it. Best-effort: on any DB
+    error, return an empty list rather than erroring.
+    """
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"items": []})
+    if _supabase is None:
+        return {"items": []}
+    try:
+        res = (_supabase.table("worth_read")
+               .select("id, created_at, type, title, body, url")
+               .eq("active", True)
+               .order("created_at", desc=True)
+               .limit(100)
+               .execute())
+        return {"items": res.data or []}
+    except Exception as e:
+        print(f"[worth_read fetch failed (ignored): {e}]")
+        return {"items": []}
+
+
 @app.get("/history")
 def history(request: Request):
     """
