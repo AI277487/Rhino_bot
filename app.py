@@ -151,6 +151,33 @@ def health():
     return {"ok": True, "chunks": query.collection.count()}
 
 
+@app.get("/history")
+def history(request: Request):
+    """
+    Return the logged-in user's own past turns, newest first, for the chat
+    history panel. Auth-gated like /chat: a user only ever sees their own rows.
+    Best-effort: on any DB error, return an empty list rather than erroring, so
+    a database blip never breaks the app.
+    """
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"turns": []})
+    user_email = getattr(user, "email", None)
+    if _supabase is None or not user_email:
+        return {"turns": []}
+    try:
+        res = (_supabase.table("query_logs")
+               .select("id, created_at, question, answer, grounded, citations")
+               .eq("user_email", user_email)
+               .order("created_at", desc=True)
+               .limit(100)
+               .execute())
+        return {"turns": res.data or []}
+    except Exception as e:
+        print(f"[history fetch failed (ignored): {e}]")
+        return {"turns": []}
+
+
 @app.post("/chat")
 def chat(body: ChatIn, request: Request):
     user = verify_user(request)
