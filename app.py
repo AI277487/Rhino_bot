@@ -76,7 +76,7 @@ except Exception as e:
     print(f"[supabase: init failed, logging OFF - {e}]")
 
 
-def log_query(question, answer, grounded, usage=None, user_email=None, user_name=None):
+def log_query(question, answer, grounded, usage=None, user_email=None, user_name=None, citations=None):
     if _supabase is None:
         return
     try:
@@ -86,6 +86,7 @@ def log_query(question, answer, grounded, usage=None, user_email=None, user_name
             "grounded": grounded,
             "user_email": user_email,
             "user_name": user_name,
+            "citations": citations,
         }
         if usage:
             row.update({
@@ -181,12 +182,12 @@ def chat(body: ChatIn, request: Request):
         if body.mode == "general":
             text = query.sonnet_fallback(msg)
             log_query(msg, text, False, usage=query.pop_usage(),
-                      user_email=user_email, user_name=user_name)
+                      user_email=user_email, user_name=user_name, citations=[])
             return {"answer": text, "citations": [], "grounded": False}
 
         reply, citations, grounded = query.answer(msg, user_id=user_id)
         log_query(msg, reply, grounded, usage=query.pop_usage(),
-                  user_email=user_email, user_name=user_name)
+                  user_email=user_email, user_name=user_name, citations=citations)
         return {"answer": reply, "citations": citations, "grounded": grounded}
 
 
