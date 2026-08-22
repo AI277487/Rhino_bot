@@ -203,6 +203,35 @@
   .signout { background:none; border:1px solid var(--line); border-radius:8px; padding:5px 11px; font-size:12px; color:var(--ink-soft); cursor:pointer; font-family:var(--mono); }
   .signout:hover { background:var(--paper); }
   .user-chip { display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
+
+  /* --- Worth Read panel (star) --- */
+  .worth-btn{ display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 12px; border:1px solid #EBD9BC; border-radius:9px; background:var(--warn-wash,#FBF2E4); color:var(--warn,#A8641B); font-family:inherit; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }
+  .worth-btn:hover{ background:#FBEBD0; border-color:var(--warn,#A8641B); }
+  .worth-btn .star{ font-size:15px; }
+  .wr-scrim{ position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .22s; z-index:80; }
+  .wr-scrim.open{ opacity:1; pointer-events:auto; }
+  .wr-panel{ position:fixed; top:0; right:0; bottom:0; width:340px; max-width:88vw; background:var(--card,#fff); border-left:1px solid var(--line,#E6E3DC); transform:translateX(100%); transition:transform .24s cubic-bezier(.4,0,.2,1); z-index:90; display:flex; flex-direction:column; box-shadow:-2px 0 24px rgba(0,0,0,.06); }
+  .wr-panel.open{ transform:translateX(0); }
+  .wr-head{ padding:20px 18px; border-bottom:1px solid var(--line,#E6E3DC); background:linear-gradient(180deg,var(--warn-wash,#FBF2E4),transparent); display:flex; align-items:flex-start; justify-content:space-between; }
+  .wr-head-title{ font-family:var(--serif,Georgia); font-size:19px; font-weight:600; color:var(--warn,#A8641B); }
+  .wr-head-sub{ font-size:12px; color:var(--ink-soft,#545A66); margin-top:3px; }
+  .wr-close{ border:none; background:none; font-size:22px; line-height:1; color:var(--ink-soft,#545A66); cursor:pointer; padding:2px 6px; }
+  .wr-close:hover{ color:var(--ink,#1C1F26); }
+  .wr-body-wrap{ padding:14px; flex:1; overflow-y:auto; }
+  .wr-item{ background:var(--card,#fff); border:1px solid var(--line,#E6E3DC); border-radius:12px; padding:14px; margin-bottom:11px; }
+  .wr-item.qa{ cursor:pointer; }
+  .wr-item.qa:hover{ border-color:var(--warn,#A8641B); }
+  .wr-tag{ display:inline-block; font-family:var(--mono,monospace); font-size:10px; letter-spacing:.04em; text-transform:uppercase; padding:2px 8px; border-radius:5px; margin-bottom:8px; }
+  .wr-tag.guideline{ background:var(--accent-wash,#EAF1F0); color:var(--accent-ink,#1B4A47); }
+  .wr-tag.question{ background:var(--warn-wash,#FBF2E4); color:var(--warn,#A8641B); }
+  .wr-title{ font-family:var(--serif,Georgia); font-size:16px; font-weight:600; line-height:1.35; margin-bottom:6px; }
+  .wr-body{ font-size:13.5px; color:var(--ink-soft,#545A66); line-height:1.55; margin-bottom:8px; }
+  .wr-body.clamp{ display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+  .wr-expand{ font-family:var(--mono,monospace); font-size:11px; color:var(--warn,#A8641B); margin-top:6px; }
+  .wr-link{ display:inline-flex; align-items:center; gap:5px; font-size:12.5px; font-weight:600; color:var(--accent,#2C6E6A); text-decoration:none; }
+  .wr-link:hover{ text-decoration:underline; }
+  .wr-date{ font-family:var(--mono,monospace); font-size:11px; color:var(--ink-soft,#545A66); margin-top:8px; }
+  .wr-empty{ text-align:center; color:var(--ink-soft,#545A66); font-size:14px; padding:40px 20px; }
 </style>
 </head>
 <body>
@@ -454,15 +483,55 @@
   }
 
   /* ============ MAIN APP ============ */
+  function WorthReadList({ items }) {
+    const [expanded, setExpanded] = useState({});
+    function fmtDate(iso){ try { return new Date(iso).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"}); } catch(e){ return ""; } }
+    if (items === null) return <div className="wr-empty">Loading…</div>;
+    if (items.length === 0) return <div className="wr-empty">Nothing here yet. Check back soon.</div>;
+    return items.map((it) => {
+      const isQ = it.type !== "guideline";
+      const isOpen = !!expanded[it.id];
+      return (
+        <div key={it.id} className={"wr-item" + (isQ ? " qa" : "")}
+             onClick={isQ ? (e)=>{ if(e.target.closest("a")) return; setExpanded(pv=>({...pv,[it.id]:!pv[it.id]})); } : undefined}>
+          <span className={"wr-tag " + (isQ ? "question" : "guideline")}>{isQ ? "Notable answer" : "Guideline"}</span>
+          <div className="wr-title">{it.title}</div>
+          {it.body && (isQ
+            ? <React.Fragment>
+                <div className={"wr-body" + (isOpen ? "" : " clamp")}>{it.body}</div>
+                <div className="wr-expand">{isOpen ? "Tap to collapse ▴" : "Tap to read full answer ▾"}</div>
+              </React.Fragment>
+            : <div className="wr-body">{it.body}</div>)}
+          {it.url && <a className="wr-link" href={it.url} target="_blank" rel="noopener">Read source →</a>}
+          <div className="wr-date">Added {fmtDate(it.created_at)}</div>
+        </div>
+      );
+    });
+  }
+
   function App({ user }) {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
     const [moreLoading, setMoreLoading] = useState(null);
     const [drawer, setDrawer] = useState(null);
+    const [worthOpen, setWorthOpen] = useState(false);
+    const [worthItems, setWorthItems] = useState(null);
     const scrollRef = useRef(null);
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
+
+    async function openWorth() {
+      setWorthOpen(true);
+      if (worthItems !== null) return;
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        const token = session ? session.access_token : "";
+        const res = await fetch("/worth_read", { headers: { "Authorization": "Bearer " + token } });
+        const data = res.ok ? await res.json() : { items: [] };
+        setWorthItems(data.items || []);
+      } catch (e) { setWorthItems([]); }
+    }
 
     async function send(text) {
       const q = (text ?? input).trim();
@@ -498,7 +567,8 @@
           <span className="logo">Rhino<span className="accent">Bot</span></span>
           <span className="tagline">ENT reference, grounded in the standard texts</span>
           <span className="corpus-note">Cummings · Scott-Brown · Stell &amp; Maran · Shambaugh</span>
-          <span className="user-chip" style={{marginLeft:"auto"}}>
+          <button className="worth-btn" style={{marginLeft:"auto"}} onClick={openWorth}><span className="star">★</span> Worth read</button>
+          <span className="user-chip" style={{marginLeft:"12px"}}>
             {user && user.email}
             <button className="signout" onClick={() => sb.auth.signOut()}>Sign out</button>
           </span>
@@ -561,6 +631,20 @@
           <div className="drawer-grip" />
           {drawer && <SourceStack drawer={drawer} onClose={() => setDrawer(null)} />}
         </div>
+
+        <div className={"wr-scrim" + (worthOpen ? " open" : "")} onClick={() => setWorthOpen(false)}></div>
+        <aside className={"wr-panel" + (worthOpen ? " open" : "")} aria-label="Worth read">
+          <div className="wr-head">
+            <div>
+              <div className="wr-head-title">★ Worth read</div>
+              <div className="wr-head-sub">Guidelines &amp; notable answers, curated by Artai</div>
+            </div>
+            <button className="wr-close" onClick={() => setWorthOpen(false)} aria-label="Close">×</button>
+          </div>
+          <div className="wr-body-wrap">
+            <WorthReadList items={worthItems} />
+          </div>
+        </aside>
       </div>
     );
   }
