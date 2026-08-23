@@ -164,9 +164,9 @@
   .send-btn:active:not(:disabled) { background:var(--accent-ink); }
   .send-btn:disabled { opacity:.4; cursor:not-allowed; }
 
-  .drawer-scrim { position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .2s; z-index:40; }
+  .drawer-scrim { position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .2s; z-index:200; }
   .drawer-scrim.open { opacity:1; pointer-events:auto; }
-  .drawer { position:fixed; left:0; right:0; bottom:0; max-width:820px; margin:0 auto; background:var(--card); border-top-left-radius:20px; border-top-right-radius:20px; box-shadow:0 -8px 40px rgba(20,22,28,0.18); transform:translateY(100%); transition:transform .26s cubic-bezier(.2,.8,.2,1); z-index:50; max-height:78vh; display:flex; flex-direction:column; padding-bottom:env(safe-area-inset-bottom); }
+  .drawer { position:fixed; left:0; right:0; bottom:0; max-width:820px; margin:0 auto; background:var(--card); border-top-left-radius:20px; border-top-right-radius:20px; box-shadow:0 -8px 40px rgba(20,22,28,0.18); transform:translateY(100%); transition:transform .26s cubic-bezier(.2,.8,.2,1); z-index:210; max-height:78vh; display:flex; flex-direction:column; padding-bottom:env(safe-area-inset-bottom); }
   .drawer.open { transform:translateY(0); }
   .drawer-grip { width:38px; height:4px; border-radius:2px; background:var(--line); margin:8px auto 0; }
   .drawer-head { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
@@ -266,6 +266,19 @@
   .recent-text{ font-size:13.5px; line-height:1.4; }
   .recent-who{ font-family:var(--serif,Georgia); font-weight:600; color:var(--accent-ink,#1B4A47); }
   .recent-q{ color:var(--ink-soft,#545A66); font-style:italic; }
+
+  /* --- Read-only Q&A modal (recently-asked + own history) --- */
+  .qa-modal-scrim{ position:fixed; inset:0; background:rgba(20,22,28,0.42); opacity:0; pointer-events:none; transition:opacity .2s; z-index:100; display:flex; align-items:flex-end; justify-content:center; }
+  .qa-modal-scrim.open{ opacity:1; pointer-events:auto; }
+  .qa-modal{ background:var(--card); width:100%; max-width:640px; max-height:88vh; border-radius:18px 18px 0 0; display:flex; flex-direction:column; transform:translateY(100%); transition:transform .24s cubic-bezier(.4,0,.2,1); overflow:hidden; }
+  .qa-modal-scrim.open .qa-modal{ transform:translateY(0); }
+  .qa-modal-head{ display:flex; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); flex:none; }
+  .qa-modal-tag{ font-family:var(--mono); font-size:11px; letter-spacing:.03em; text-transform:uppercase; color:var(--ink-soft); }
+  .qa-modal-close{ width:34px; height:34px; border:1px solid var(--line); border-radius:9px; background:var(--card); cursor:pointer; font-size:20px; line-height:1; color:var(--ink-soft); display:flex; align-items:center; justify-content:center; }
+  .qa-modal-close:hover{ background:var(--accent-wash); color:var(--ink); border-color:var(--accent); }
+  .qa-modal-body{ padding:18px 18px 26px; overflow-y:auto; }
+  .qa-modal-q{ font-family:var(--serif); font-size:18px; font-weight:600; margin-bottom:12px; line-height:1.35; }
+  @media(min-width:560px){ .qa-modal-scrim{ align-items:center; } .qa-modal{ border-radius:18px; max-height:82vh; } }
 </style>
 </head>
 <body>
@@ -555,6 +568,7 @@
     const [histView, setHistView] = useState(false);
     const [histItems, setHistItems] = useState(null);
     const [recentItems, setRecentItems] = useState(null);
+    const [modalItem, setModalItem] = useState(null); // {tag, question, answer, citations}
     const scrollRef = useRef(null);
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
@@ -583,11 +597,7 @@
       } catch (e) { setHistItems([]); }
     }
     function reopenTurn(turn) {
-      // rebuild the exact message shape AnswerBody expects, from the stored row
-      setMessages([
-        { role:"user", text: turn.question },
-        { role:"bot", text: turn.answer, citations: turn.citations || [], grounded: !!turn.grounded, question: turn.question },
-      ]);
+      setModalItem({ tag: "Your past question", question: turn.question, answer: turn.answer, citations: turn.citations || [] });
       setAcctOpen(false);
       setHistView(false);
     }
@@ -604,10 +614,7 @@
       })();
     }, []);
     function viewRecent(it) {
-      setMessages([
-        { role:"user", text: it.question },
-        { role:"bot", text: it.answer, citations: it.citations || [], grounded: true, question: it.question },
-      ]);
+      setModalItem({ tag: "Shared answer", question: it.question, answer: it.answer, citations: it.citations || [] });
     }
 
     async function send(text) {
@@ -715,6 +722,21 @@
         <div className={"drawer " + (drawer ? "open" : "")}>
           <div className="drawer-grip" />
           {drawer && <SourceStack drawer={drawer} onClose={() => setDrawer(null)} />}
+        </div>
+
+        <div className={"qa-modal-scrim" + (modalItem ? " open" : "")} onClick={(e) => { if (e.target === e.currentTarget) setModalItem(null); }}>
+          {modalItem && (
+            <div className="qa-modal">
+              <div className="qa-modal-head">
+                <span className="qa-modal-tag">{modalItem.tag}</span>
+                <button className="qa-modal-close" onClick={() => setModalItem(null)} aria-label="Close">×</button>
+              </div>
+              <div className="qa-modal-body">
+                <div className="qa-modal-q">{modalItem.question}</div>
+                <AnswerBody text={modalItem.answer} citations={modalItem.citations || []} onCite={setDrawer} />
+              </div>
+            </div>
+          )}
         </div>
 
         <div className={"wr-scrim" + (worthOpen ? " open" : "")} onClick={() => setWorthOpen(false)}></div>
