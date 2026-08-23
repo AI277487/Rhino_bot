@@ -38,6 +38,11 @@ _lock = threading.Lock()
 FREE_LIMIT = 15
 UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
 
+# Emails hidden from the public "recently asked" feed only (NOT the cap bypass).
+# Only the owner's own testing account is hidden; Arti stays visible so the feed
+# isn't empty during early launch. This is separate from UNLIMITED by design.
+FEED_HIDE = {"arpitr1809@gmail.com"}
+
 _BLOCK_MESSAGE = (
     "You've used all 15 of your questions for now. "
     "RhinoBot is still in early access, so we're handling additional access "
@@ -150,6 +155,65 @@ _PWA_FILES = {
 @app.get("/health")
 def health():
     return {"ok": True, "chunks": query.collection.count()}
+
+
+def _mask_name(name):
+    """Backend name masking for the public recently-asked feed: show first 3
+    letters of the first name, title-cased, then two stars. e.g. 'ARPIT RAJPUT'
+    -> 'Dr. Arp**'. The full name never leaves the server."""
+    first = ""
+    if name and name.strip():
+        first = name.strip().split()[0][:3].capitalize()
+    return f"Dr. {first}**" if first else "Dr. Anonymous"
+
+
+@app.get("/recent")
+def recent(request: Request):
+    """
+    Recently-asked feed: the 3 most recent DISTINCT grounded questions across all
+    users, shown as social proof. Excludes the unlimited (owner) emails so the
+    feed reflects real user activity, not our own testing. Names are masked
+    server-side. Shows resolved_question (Sonnet's standalone form) so context
+    follow-ups like 'more' read as real questions. Auth-gated (after-login).
+    Best-effort: on error, empty list.
+    """
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"items": []})
+    if _supabase is None:
+        return {"items": []}
+    try:
+        # pull a window of recent grounded rows, then dedupe to 3 distinct questions
+        res = (_supabase.table("query_logs")
+               .select("resolved_question, user_name, user_email, created_at")
+               .eq("grounded", True)
+               .order("created_at", desc=True)
+               .limit(60)
+               .execute())
+        rows = res.data or []
+        seen = set()
+        items = []
+        for r in rows:
+            email = (r.get("user_email") or "").lower()
+            if email in FEED_HIDE:                 # hide owner testing acct from feed only
+                continue
+            q = (r.get("resolved_question") or "").strip()
+            if not q:
+                continue
+            key = q.lower()
+            if key in seen:                        # distinct questions only
+                continue
+            seen.add(key)
+            items.append({
+                "who": _mask_name(r.get("user_name")),
+                "question": q,
+            })
+            if len(items) >= 3:
+                break
+        return {"items": items}
+    except Exception as e:
+        print(f"[recent fetch failed (ignored): {e}]")
+        return {"items": []}
 
 
 @app.get("/worth_read")

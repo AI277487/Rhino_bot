@@ -56,11 +56,11 @@
 
   .header {
     padding:14px 16px 12px; padding-top:calc(14px + env(safe-area-inset-top));
-    border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+    border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; flex-wrap:nowrap;
   }
-  .logo { font-family:var(--serif); font-size:22px; font-weight:600; letter-spacing:-0.01em; }
+  .logo { font-family:var(--serif); font-size:22px; font-weight:600; letter-spacing:-0.01em; white-space:nowrap; flex:none; }
   .logo .accent { color:var(--accent); }
-  .tagline { font-size:12.5px; color:var(--ink-soft); }
+  .tagline { font-size:12.5px; color:var(--ink-soft); display:none; }
   .corpus-note { margin-left:auto; font-size:10px; color:var(--ink-soft); font-family:var(--mono); text-transform:uppercase; letter-spacing:0.04em; display:none; }
 
   .messages { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:18px 16px; display:flex; flex-direction:column; gap:18px; }
@@ -183,7 +183,7 @@
 
   @media (min-width:640px) {
     .header { padding:20px 26px 16px; }
-    .logo { font-size:26px; } .tagline { font-size:13px; }
+    .logo { font-size:26px; } .tagline { font-size:13px; display:inline; }
     .corpus-note { display:inline; font-size:11px; }
     .messages { padding:26px; gap:22px; }
     .bubble { max-width:88%; }
@@ -205,7 +205,7 @@
   .user-chip { display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
 
   /* --- Worth Read panel (star) --- */
-  .worth-btn{ display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 12px; border:1px solid #EBD9BC; border-radius:9px; background:var(--warn-wash,#FBF2E4); color:var(--warn,#A8641B); font-family:inherit; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }
+  .worth-btn{ flex:none; display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 12px; border:1px solid #EBD9BC; border-radius:9px; background:var(--warn-wash,#FBF2E4); color:var(--warn,#A8641B); font-family:inherit; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }
   .worth-btn:hover{ background:#FBEBD0; border-color:var(--warn,#A8641B); }
   .worth-btn .star{ font-size:15px; }
   .wr-scrim{ position:fixed; inset:0; background:rgba(20,22,28,0.28); opacity:0; pointer-events:none; transition:opacity .22s; z-index:80; }
@@ -617,10 +617,6 @@
           <span className="tagline">ENT reference, grounded in the standard texts</span>
           <span className="corpus-note">Cummings · Scott-Brown · Stell &amp; Maran · Shambaugh</span>
           <button className="worth-btn" style={{marginLeft:"auto"}} onClick={openWorth}><span className="star">★</span> Worth read</button>
-          <span className="user-chip" style={{marginLeft:"12px"}}>
-            {user && user.email}
-            <button className="signout" onClick={() => sb.auth.signOut()}>Sign out</button>
-          </span>
         </div>
 
         <div className="messages" ref={scrollRef}>
