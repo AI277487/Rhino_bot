@@ -185,7 +185,7 @@ def recent(request: Request):
     try:
         # pull a window of recent grounded rows, then dedupe to 3 distinct questions
         res = (_supabase.table("query_logs")
-               .select("resolved_question, user_name, user_email, created_at")
+               .select("resolved_question, answer, citations, user_name, user_email, created_at")
                .eq("grounded", True)
                .order("created_at", desc=True)
                .limit(60)
@@ -207,6 +207,8 @@ def recent(request: Request):
             items.append({
                 "who": _mask_name(r.get("user_name")),
                 "question": q,
+                "answer": r.get("answer") or "",
+                "citations": r.get("citations") or [],
             })
             if len(items) >= 3:
                 break

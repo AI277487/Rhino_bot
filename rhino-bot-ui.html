@@ -256,6 +256,16 @@
   .hist-q{ font-size:14px; font-weight:500; }
   .hist-meta{ font-family:var(--mono,monospace); font-size:11px; color:var(--ink-soft,#545A66); margin-top:4px; }
   .hist-cites{ color:var(--accent,#2C6E6A); }
+
+  /* --- Recently asked feed --- */
+  .recent-wrap{ max-width:460px; margin:20px auto 0; text-align:left; }
+  .recent-label{ font-family:var(--mono,monospace); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-soft,#545A66); margin-bottom:10px; text-align:center; }
+  .recent-item{ background:var(--card,#fff); border:1px solid var(--line,#E6E3DC); border-radius:12px; padding:11px 13px; margin-bottom:8px; display:flex; align-items:flex-start; gap:9px; cursor:pointer; }
+  .recent-item:hover{ border-color:var(--accent,#2C6E6A); background:var(--accent-wash,#EAF1F0); }
+  .recent-dot{ width:6px; height:6px; border-radius:50%; background:var(--accent,#2C6E6A); flex:none; margin-top:6px; }
+  .recent-text{ font-size:13.5px; line-height:1.4; }
+  .recent-who{ font-family:var(--serif,Georgia); font-weight:600; color:var(--accent-ink,#1B4A47); }
+  .recent-q{ color:var(--ink-soft,#545A66); font-style:italic; }
 </style>
 </head>
 <body>
@@ -544,6 +554,7 @@
     const [acctOpen, setAcctOpen] = useState(false);
     const [histView, setHistView] = useState(false);
     const [histItems, setHistItems] = useState(null);
+    const [recentItems, setRecentItems] = useState(null);
     const scrollRef = useRef(null);
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
@@ -579,6 +590,24 @@
       ]);
       setAcctOpen(false);
       setHistView(false);
+    }
+
+    useEffect(() => {
+      (async () => {
+        try {
+          const { data: { session } } = await sb.auth.getSession();
+          const token = session ? session.access_token : "";
+          const res = await fetch("/recent", { headers: { "Authorization": "Bearer " + token } });
+          const data = res.ok ? await res.json() : { items: [] };
+          setRecentItems(data.items || []);
+        } catch (e) { setRecentItems([]); }
+      })();
+    }, []);
+    function viewRecent(it) {
+      setMessages([
+        { role:"user", text: it.question },
+        { role:"bot", text: it.answer, citations: it.citations || [], grounded: true, question: it.question },
+      ]);
     }
 
     async function send(text) {
@@ -627,6 +656,17 @@
               <div className="examples">
                 {examples.map((ex, i) => (<button key={i} className="example-chip" onClick={() => send(ex)}>{ex}</button>))}
               </div>
+              {recentItems && recentItems.length > 0 && (
+                <div className="recent-wrap">
+                  <div className="recent-label">Recently asked</div>
+                  {recentItems.map((it, idx) => (
+                    <div key={idx} className="recent-item" onClick={() => viewRecent(it)}>
+                      <span className="recent-dot"></span>
+                      <span className="recent-text"><span className="recent-who">{it.who}</span> <span className="recent-q">asked “{it.question}”</span></span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
