@@ -249,8 +249,21 @@ PLAN_TOOL = {
                     "already covered in the previous answer."
                 ),
             },
+            "in_scope": {
+                "type": "boolean",
+                "description": (
+                    "Whether the question is answerable within ENT "
+                    "(otorhinolaryngology / head & neck, audiology and directly "
+                    "related topics). Interpret ambiguous questions in the ENT "
+                    "frame and set true — 'what antibiotics are used' means in "
+                    "ENT, 'NICE guidelines' means the ENT-relevant ones. Set "
+                    "FALSE only when the question is clearly a non-ENT medical "
+                    "field with no reasonable ENT reading (orthopedic fractures, "
+                    "cardiac conditions, obstetrics). When in doubt, true."
+                ),
+            },
         },
-        "required": ["standalone_question", "sub_queries"],
+        "required": ["standalone_question", "sub_queries", "in_scope"],
     },
 }
 
@@ -262,7 +275,7 @@ PLANNER_SYSTEM = (
     "strong ENT knowledge; use it to plan retrieval that yields the most "
     "COMPLETE, well-grounded set of chunks. Each answer cites specific textbook "
     "pages, so the chunks you cause to be retrieved determine answer quality.\n\n"
-    "Return two things via search_plan:\n\n"
+    "Return three things via search_plan:\n\n"
     "A) standalone_question — the full question the assistant should ANSWER, "
     "with follow-up references resolved from the conversation. If the user says "
     "'give more complications' after a FESS answer, resolve it to 'What are the "
@@ -301,8 +314,13 @@ PLANNER_SYSTEM = (
     "2. Search by CATEGORY, not by specific answer. Name the sub-topic to look "
     "in ('medical management of otosclerosis'), not the specific facts you "
     "expect to find. You decide WHERE to look; the textbook decides WHAT is there."
+    "\n\nC) in_scope — whether this question belongs to ENT (ear, nose, throat, "
+    "head & neck, audiology and directly related topics). Interpret ambiguous "
+    "questions in the ENT frame and set it true; set it FALSE only when the "
+    "question is clearly a non-ENT medical field with no reasonable ENT reading "
+    "(orthopedic fractures, cardiac conditions, obstetrics). When in doubt, true. "
+    "Always still return a standalone_question and sub_queries even when it is false."
 )
-
 
 def plan_query(question, history=None):
     """Ask Sonnet for a search plan. Returns (standalone_question, sub_queries).
@@ -328,8 +346,12 @@ def plan_query(question, history=None):
         plan = next((b.input for b in msg.content
                      if getattr(b, "type", None) == "tool_use"), None)
         if not plan:
-            return question, [question]
+            return question, [question], True
         standalone = (plan.get("standalone_question") or question).strip()
+
+        # scope flag: default True when absent/None so a missing field never refuses
+        raw_scope = plan.get("in_scope")
+        in_scope = True if raw_scope is None else bool(raw_scope)
 
         raw_subs = plan.get("sub_queries")
         # schema is NOT strictly enforced: a malformed/truncated tool call can
@@ -347,10 +369,10 @@ def plan_query(question, history=None):
             print("[planner sub_queries fragmented -> using standalone]")
             subs = [standalone]
 
-        return standalone, (subs if subs else [standalone])
+        return standalone, (subs if subs else [standalone]), in_scope
     except Exception as e:
         print(f"[planner error -> single search: {e}]")
-        return question, [question]
+        return question, [question], True
 
 
 def extract_text(msg):
@@ -451,120 +473,12 @@ def build_citations(answer_text, picked):
     return cites
 
 
-CONTEXTUALIZE_TOOL = {
-    "name": "emit_search_query",
-    "description": "Return the standalone search query for the follow-up question.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": ("The follow-up rewritten as a standalone question. "
-                                "If it introduces a new unrelated topic, return it "
-                                "verbatim. No commentary, just the question."),
-            }
-        },
-        "required": ["query"],
-    },
-}
-
-
-def contextualize(query, history):
-    if not history:
-        return query
-
-    # skip the LLM entirely ONLY for clearly-standalone questions. Two things
-    # signal a follow-up that needs rewriting even without a pronoun:
-    #   - back-reference pronouns (it/this/they/that ...)
-    #   - continuation/elaboration words (more/else/other/another/also/continue
-    #     /expand/further ...) — "give more complications" has NO pronoun but is
-    #     entirely dependent on the previous turn.
-    words = query.lower().split()
-    has_backref = any(w in words for w in
-                      ("it", "its", "this", "that", "they", "them", "these",
-                       "those", "he", "she", "his", "her", "their", "one"))
-    has_continuation = any(w in words for w in
-                      ("more", "else", "other", "others", "another", "also",
-                       "additional", "additionally", "continue", "expand",
-                       "further", "elaborate", "again", "rest"))
-    is_short = len(words) < 4          # short fragments are usually follow-ups
-    if not has_backref and not has_continuation and not is_short:
-        return query
-
-    recent = "\n".join(history[-4:])
-    try:
-        msg = anthropic_client.messages.create(
-            model=HAIKU,
-            max_tokens=150,
-            tools=[CONTEXTUALIZE_TOOL],
-            tool_choice={"type": "tool", "name": "emit_search_query"},
-            messages=[{"role": "user", "content":
-                f"""Rewrite the follow-up into a standalone search query using the conversation for context.
-
-Rules:
-- If it refers back to the prior topic (it/this/they/that, or clearly continuing), rewrite it to name that specific topic.
-- If it introduces a NEW, unrelated topic, return it UNCHANGED — do NOT attach the prior topic.
-
-Conversation:
-{recent}
-
-Follow-up: {query}"""}],
-        )
-        out = next((b.input.get("query") for b in msg.content
-                    if getattr(b, "type", None) == "tool_use"), None)
-        return out.strip() if out else query
-    except Exception:
-        return query          # any API hiccup -> just search the raw query
-DECOMPOSE_TOOL = {
-    "name": "decompose_query",
-    "description": (
-        "Break an ENT question into focused retrieval sub-queries. For comparative "
-        "or multi-topic questions (differentiate X from Y, X vs Y, difference "
-        "between X and Y), produce ONE self-contained sub-query per topic, each "
-        "naming that topic explicitly and stating what is asked (its management, "
-        "its otoscopic appearance, etc.). For a simple single-topic question, "
-        "return the question unchanged as the only item."
-        "For MANAGEMENT/TREATMENT questions, keep the condition name as the primary term "
-        "and append a few general treatment-category words (e.g. 'treatment, medical "
-        "management, drug therapy, prophylaxis, surgical options') to steer retrieval "
-        "toward therapy sections. Do NOT list specific named drugs unless they appear in "
-        "the user's question — use only generic category terms."
-
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "subqueries": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "1-4 focused, self-contained search queries.",
-            }
-        },
-        "required": ["subqueries"],
-    },
-}
-
-
-def decompose(query):
-    try:
-        msg = anthropic_client.messages.create(
-            model=HAIKU,
-            max_tokens=250,
-            tools=[DECOMPOSE_TOOL],
-            tool_choice={"type": "tool", "name": "decompose_query"},
-            messages=[{"role": "user", "content":
-                f"Split this ENT question into focused retrieval sub-queries.\n\n"
-                f"Question: {query}"}],
-        )
-        subs = next((b.input.get("subqueries") for b in msg.content
-                     if getattr(b, "type", None) == "tool_use"), None)
-        subs = [s.strip() for s in (subs or []) if s and s.strip()]
-        return subs if subs else [query]
-    except Exception:
-        return [query]        # any hiccup -> single-query behaviour, unchanged
-
 OUT_OF_SCOPE_MARKER = "OUT_OF_SCOPE"
-
+OUT_OF_SCOPE_REPLY = (
+    "This question is outside my scope. I'm an ENT (ear, nose, throat, "
+    "head & neck) reference assistant and can't help with topics outside "
+    "otorhinolaryngology."
+)
 FALLBACK_SYSTEM = (
     "You are an ENT (otorhinolaryngology / head and neck surgery) reference "
     "assistant. Your scope is ENT: the ear, nose, throat, head and neck, "
@@ -600,9 +514,7 @@ def sonnet_fallback(question):
     body = extract_text(msg)
 
     if OUT_OF_SCOPE_MARKER in body:
-        return ("This question is outside my scope. I'm an ENT (ear, nose, throat, "
-                "head & neck) reference assistant and can't help with topics outside "
-                "otorhinolaryngology.")
+        return OUT_OF_SCOPE_REPLY
 
     disclaimer = ("⚠️ Not found in the textbook sources — the following is from "
                   "general ENT knowledge, is not citation-grounded, and should be "
@@ -696,7 +608,14 @@ def answer(query, user_id="default"):
     # 2. Sonnet plans in ONE call: resolves the follow-up into a standalone
     #    question (what Haiku answers) AND decomposes into retrieval sub-queries.
     #    This replaces both contextualize() and decompose().
-    search_query, subqueries = plan_query(query, history)
+    search_query, subqueries, in_scope = plan_query(query, history)
+    if not in_scope:
+        reply = OUT_OF_SCOPE_REPLY
+        history.append(f"User: {query}")
+        history.append(f"Assistant: {reply}")
+        if len(history) > 20:
+            del history[:-20]
+        return reply, [], False, search_query
     print(f"[answer question: {search_query}]")
     print(f"[plan: {subqueries}]")
 
@@ -849,7 +768,8 @@ if __name__ == "__main__":
         que = input("\nAsk (or 'quit'): ")
         if que.lower() == "quit":
             break
-        text, cites, grounded = answer(que)
+        text, cites, grounded, resolved = answer(que)
         print("\n" + text)
+        print("resolved:", resolved)
         print("grounded:", grounded)
         print("citations:", [(c["book"], c["page"]) for c in cites])
