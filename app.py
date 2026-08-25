@@ -4,6 +4,9 @@ app.py — FastAPI wrapper around query.py for Rhino Bot.
 
 import os
 import threading
+from datetime import datetime, timedelta, timezone
+
+import razorpay
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,6 +82,25 @@ try:
         print("[supabase: not configured - query logging OFF]")
 except Exception as e:
     print(f"[supabase: init failed, logging OFF - {e}]")
+
+# --- Razorpay client (pack payments) ---------------------------------------
+_RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
+_RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
+_razorpay = None
+if _RAZORPAY_KEY_ID and _RAZORPAY_KEY_SECRET:
+    _razorpay = razorpay.Client(auth=(_RAZORPAY_KEY_ID, _RAZORPAY_KEY_SECRET))
+    print("[razorpay: configured]")
+else:
+    print("[razorpay: not configured - payments OFF]")
+
+PACK_PRICE_PAISE = 19900     # ₹199, in paise (Razorpay's smallest unit)
+PACK_DURATION_DAYS = 30
+PACK_QUERY_LIMIT = 100       # invisible safety cap within an active pack
+
+_FAIR_USE_MESSAGE = (
+    "You've reached this pack's usage limit. Buy another 30-day pack for "
+    "\u20b9199 to keep going right away."
+)
 
 
 def log_query(question, answer, grounded, usage=None, user_email=None, user_name=None, citations=None, resolved_question=None):
@@ -218,6 +240,126 @@ def recent(request: Request):
         return {"items": []}
 
 
+def get_active_pack(email):
+    """
+    Return the user's most recent NOT-YET-EXPIRED pack row, or None. Used to
+    decide whether the 15-lifetime cap should be bypassed. Fails open (returns
+    None) on any DB error -- a DB blip should not revoke someone's paid access
+    by accident is the wrong failure direction here, so we treat "can't tell"
+    as "fall through to the free-tier check" rather than blocking outright.
+    """
+    if _supabase is None or not email:
+        return None
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        res = (_supabase.table("packs")
+               .select("id, purchased_at, expires_at")
+               .eq("user_email", email)
+               .gt("expires_at", now_iso)
+               .order("purchased_at", desc=True)
+               .limit(1)
+               .execute())
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[pack lookup failed (ignored): {e}]")
+        return None
+
+
+def count_user_queries_since(email, since_iso):
+    """Count this user's query_logs rows since a given timestamp (for the
+    invisible in-pack 100-query safety cap). Fails open (None) on DB error."""
+    if _supabase is None or not email:
+        return None
+    try:
+        res = (_supabase.table("query_logs")
+               .select("id", count="exact")
+               .eq("user_email", email)
+               .gte("created_at", since_iso)
+               .execute())
+        return res.count
+    except Exception as e:
+        print(f"[pack usage count failed (ignored): {e}]")
+        return None
+
+
+class VerifyPaymentIn(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@app.post("/create_order")
+def create_order(request: Request):
+    """Start a one-time ₹199 / 30-day pack purchase. Returns what the
+    frontend needs to open Razorpay Checkout. No DB write here -- the pack is
+    only granted after /verify_payment confirms a genuine signed payment."""
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"error": "Please sign in."})
+    if _razorpay is None:
+        return JSONResponse(status_code=500, content={"error": "Payments are not configured yet."})
+    try:
+        order = _razorpay.order.create({
+            "amount": PACK_PRICE_PAISE,
+            "currency": "INR",
+            "notes": {"user_email": user.email},
+        })
+        return {
+            "order_id": order["id"],
+            "amount": order["amount"],
+            "currency": order["currency"],
+            "key_id": _RAZORPAY_KEY_ID,
+        }
+    except Exception as e:
+        print(f"[create_order failed: {e}]")
+        return JSONResponse(status_code=500, content={"error": "Could not start payment. Try again."})
+
+
+@app.post("/verify_payment")
+def verify_payment(body: VerifyPaymentIn, request: Request):
+    """Verify a completed payment's signature, then grant a 30-day pack.
+    CRITICAL: a pack is only ever written to the DB after signature
+    verification succeeds -- this is what stops a forged/tampered request
+    from granting free access."""
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"error": "Please sign in."})
+    if _razorpay is None:
+        return JSONResponse(status_code=500, content={"error": "Payments are not configured yet."})
+
+    try:
+        _razorpay.utility.verify_payment_signature({
+            "razorpay_order_id": body.razorpay_order_id,
+            "razorpay_payment_id": body.razorpay_payment_id,
+            "razorpay_signature": body.razorpay_signature,
+        })
+    except razorpay.errors.SignatureVerificationError:
+        print(f"[verify_payment: BAD SIGNATURE for order {body.razorpay_order_id}]")
+        return JSONResponse(status_code=400, content={"error": "Payment could not be verified."})
+    except Exception as e:
+        print(f"[verify_payment: error {e}]")
+        return JSONResponse(status_code=400, content={"error": "Payment could not be verified."})
+
+    # Signature is genuine -- grant the pack.
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=PACK_DURATION_DAYS)
+    try:
+        _supabase.table("packs").insert({
+            "user_email": user.email,
+            "purchased_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+            "razorpay_order_id": body.razorpay_order_id,
+            "razorpay_payment_id": body.razorpay_payment_id,
+            "amount_paise": PACK_PRICE_PAISE,
+        }).execute()
+    except Exception as e:
+        print(f"[pack grant insert failed: {e}]")
+        return JSONResponse(status_code=500, content={"error": "Payment succeeded but activation failed -- email support.artai@gmail.com with your payment id."})
+
+    return {"ok": True, "expires_at": expires.isoformat()}
+
+
 @app.get("/worth_read")
 def worth_read(request: Request):
     """
@@ -287,12 +429,22 @@ def chat(body: ChatIn, request: Request):
     user_name = _meta.get("full_name") or _meta.get("name") or None
 
     # --- Cap gate: checked BEFORE any retrieval/model call, so a blocked
-    # request costs nothing. Unlimited emails skip it. On DB error we fail
-    # open (count is None) rather than lock the user out.
+    # request costs nothing. Unlimited emails skip it entirely. Everyone else:
+    # an ACTIVE PACK bypasses the free-15 cap (subject to its own invisible
+    # 100-in-30-days safety net); no active pack falls through to the
+    # original free-15-lifetime check. On DB error we fail open throughout
+    # rather than lock a user (paid or free) out.
     if user_email and user_email.lower() not in UNLIMITED:
-        used = count_user_queries(user_email)
-        if used is not None and used >= FREE_LIMIT:
-            return {"answer": _BLOCK_MESSAGE, "citations": [], "grounded": False}
+        pack = get_active_pack(user_email)
+        if pack:
+            used_in_pack = count_user_queries_since(user_email, pack["purchased_at"])
+            if used_in_pack is not None and used_in_pack >= PACK_QUERY_LIMIT:
+                return {"answer": _FAIR_USE_MESSAGE, "citations": [], "grounded": False}
+            # else: active pack, under the safety cap -> allowed, skip free-15 check
+        else:
+            used = count_user_queries(user_email)
+            if used is not None and used >= FREE_LIMIT:
+                return {"answer": _BLOCK_MESSAGE, "citations": [], "grounded": False}
 
     msg = (body.message or "").strip()
     if not msg:
