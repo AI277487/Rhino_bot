@@ -38,7 +38,7 @@ _lock = threading.Lock()
 # Free users get FREE_LIMIT answered queries, lifetime (no reset). The two
 # emails in UNLIMITED bypass the cap entirely. Compared lowercased because
 # Google can return mixed-case emails.
-FREE_LIMIT = 15
+FREE_LIMIT = 1
 UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
 
 # Emails hidden from the public "recently asked" feed only (NOT the cap bypass).
@@ -47,10 +47,9 @@ UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
 FEED_HIDE = {"arpitr1809@gmail.com"}
 
 _BLOCK_MESSAGE = (
-    "You've used all 15 of your questions for now. "
-    "RhinoBot is still in early access, so we're handling additional access "
-    "personally. Email support.artai@gmail.com with \"upgrade\" in your "
-    "message and we'll set you up."
+    "You've used all 15 of your free questions. Get 30 days of full access "
+    "for \u20b9199 below \u2014 or email support.artai@gmail.com if you run "
+    "into any trouble."
 )
 
 
