@@ -38,7 +38,7 @@ _lock = threading.Lock()
 # Free users get FREE_LIMIT answered queries, lifetime (no reset). The two
 # emails in UNLIMITED bypass the cap entirely. Compared lowercased because
 # Google can return mixed-case emails.
-FREE_LIMIT = 1
+FREE_LIMIT = 15
 UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
 
 # Emails hidden from the public "recently asked" feed only (NOT the cap bypass).
