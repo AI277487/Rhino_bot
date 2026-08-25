@@ -339,6 +339,7 @@
         grounded: !!data.grounded,
         citations: Array.isArray(data.citations) ? data.citations : [],
         answer: data.answer || "",
+        paywall: !!data.paywall,
       };
     } catch (e) {
       return { grounded:false, citations:[],
