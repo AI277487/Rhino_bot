@@ -706,7 +706,7 @@
       setLoading(true);
       const res = await mockApi(q, "grounded");
       setLoading(false);
-      setMessages(prev => [...prev, { role:"bot", text:res.answer, citations:res.citations, grounded:res.grounded, question:q }]);
+      setMessages(prev => [...prev, { role:"bot", text:res.answer, citations:res.citations, grounded:res.grounded, question:q, paywall: !!res.paywall }]);
     }
     async function getGeneral(msgIndex, question) {
       setMoreLoading(msgIndex);
@@ -761,12 +761,12 @@
           {messages.map((m, i) => (
             <div key={i} className={"msg " + m.role}>
               <div className="bubble">
-                {m.role === "bot" && (
+                {m.role === "bot" && !m.paywall && (
                   <div className={"badge " + (m.grounded ? "grounded" : "general")}>
                     {m.grounded ? "§ From textbooks" : "⚠ General knowledge"}
                   </div>
                 )}
-                {m.role === "bot" && !m.grounded && (
+                {m.role === "bot" && !m.grounded && !m.paywall && (
                   <div className="warn-note">Not from the indexed textbooks. Verify against a primary source before relying on this.</div>
                 )}
 
