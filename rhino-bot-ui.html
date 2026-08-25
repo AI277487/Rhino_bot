@@ -279,7 +279,23 @@
   .qa-modal-body{ padding:18px 18px 26px; overflow-y:auto; }
   .qa-modal-q{ font-family:var(--serif); font-size:18px; font-weight:600; margin-bottom:12px; line-height:1.35; }
   @media(min-width:560px){ .qa-modal-scrim{ align-items:center; } .qa-modal{ border-radius:18px; max-height:82vh; } }
+
+  /* --- Upgrade / pack payment --- */
+  .upgrade-btn{ font-family:inherit; font-size:12px; font-weight:600; border:1px solid var(--accent,#2C6E6A); background:var(--accent,#2C6E6A); color:#fff; border-radius:8px; padding:7px 13px; cursor:pointer; }
+  .upgrade-btn:hover{ background:var(--accent-ink,#1B4A47); }
+  .upgrade-btn:disabled{ opacity:.6; cursor:default; }
+  .pay-success{ font-family:inherit; font-size:13px; color:var(--accent-ink,#1B4A47); background:var(--accent-wash,#EAF1F0); border:1px solid var(--accent,#2C6E6A); border-radius:8px; padding:8px 12px; margin-top:8px; }
+  .pay-error{ font-family:inherit; font-size:12px; color:var(--warn,#A8641B); margin-top:6px; }
+
+  .panel-upgrade{ margin-bottom:14px; }
+  .panel-upgrade-btn{ width:100%; font-family:inherit; font-size:14px; font-weight:600; border:1px solid var(--accent,#2C6E6A); background:var(--accent,#2C6E6A); color:#fff; border-radius:10px; padding:12px 14px; cursor:pointer; }
+  .panel-upgrade-btn:hover{ background:var(--accent-ink,#1B4A47); }
+  .panel-upgrade-btn:disabled{ opacity:.6; cursor:default; }
+  .panel-pack-note{ font-family:var(--mono,monospace); font-size:11.5px; color:var(--accent-ink,#1B4A47); background:var(--accent-wash,#EAF1F0); border:1px solid var(--accent,#2C6E6A); border-radius:8px; padding:9px 12px; margin-bottom:14px; }
+  .panel-pay-success{ font-family:inherit; font-size:12.5px; color:var(--accent-ink,#1B4A47); background:var(--accent-wash,#EAF1F0); border:1px solid var(--accent,#2C6E6A); border-radius:8px; padding:9px 12px; margin-bottom:14px; }
+  .panel-pay-error{ font-family:inherit; font-size:12px; color:var(--warn,#A8641B); margin-bottom:10px; }
 </style>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 </head>
 <body>
   <div id="root"></div>
@@ -569,6 +585,8 @@
     const [histItems, setHistItems] = useState(null);
     const [recentItems, setRecentItems] = useState(null);
     const [modalItem, setModalItem] = useState(null); // {tag, question, answer, citations}
+    const [payState, setPayState] = useState({}); // { [messageIndex]: 'idle'|'loading'|'success'|'error' }
+    const [packStatus, setPackStatus] = useState(null); // null=loading, {active, expires_at, unlimited}
     const scrollRef = useRef(null);
 
     useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading, moreLoading]);
@@ -617,6 +635,69 @@
       setModalItem({ tag: "Shared answer", question: it.question, answer: it.answer, citations: it.citations || [] });
     }
 
+    async function startUpgrade(msgIndex) {
+      setPayState(p => ({ ...p, [msgIndex]: "loading" }));
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        const token = session ? session.access_token : "";
+        const orderRes = await fetch("/create_order", { method: "POST", headers: { "Authorization": "Bearer " + token } });
+        const order = await orderRes.json();
+        if (!orderRes.ok || !order.order_id) {
+          setPayState(p => ({ ...p, [msgIndex]: "error" }));
+          return;
+        }
+        const rzp = new window.Razorpay({
+          key: order.key_id,
+          amount: order.amount,
+          currency: order.currency,
+          order_id: order.order_id,
+          name: "RhinoBot",
+          description: "30 days full access",
+          theme: { color: "#2C6E6A" },
+          handler: async function (response) {
+            try {
+              const verifyRes = await fetch("/verify_payment", {
+                method: "POST",
+                headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  razorpay_order_id: response.razorpay_order_id,
+                  razorpay_payment_id: response.razorpay_payment_id,
+                  razorpay_signature: response.razorpay_signature,
+                }),
+              });
+              const verifyData = await verifyRes.json();
+              setPayState(p => ({ ...p, [msgIndex]: verifyRes.ok && verifyData.ok ? "success" : "error" }));
+            } catch (e) {
+              setPayState(p => ({ ...p, [msgIndex]: "error" }));
+            }
+          },
+          modal: {
+            ondismiss: function () {
+              setPayState(p => ({ ...p, [msgIndex]: "idle" }));
+            },
+          },
+        });
+        rzp.on("payment.failed", function () {
+          setPayState(p => ({ ...p, [msgIndex]: "error" }));
+        });
+        rzp.open();
+      } catch (e) {
+        setPayState(p => ({ ...p, [msgIndex]: "error" }));
+      }
+    }
+
+    async function fetchPackStatus() {
+      try {
+        const { data: { session } } = await sb.auth.getSession();
+        const token = session ? session.access_token : "";
+        const res = await fetch("/pack_status", { headers: { "Authorization": "Bearer " + token } });
+        const data = res.ok ? await res.json() : { active: false };
+        setPackStatus(data);
+      } catch (e) {
+        setPackStatus({ active: false }); // fail open: show the upgrade button rather than hide it
+      }
+    }
+
     async function send(text) {
       const q = (text ?? input).trim();
       if (!q || loading) return;
@@ -648,7 +729,7 @@
     return (
       <div className="app">
         <div className="header">
-          <button className="ham-btn" onClick={() => { setAcctOpen(true); setHistView(false); }} aria-label="Menu"><span></span><span></span><span></span></button>
+          <button className="ham-btn" onClick={() => { setAcctOpen(true); setHistView(false); fetchPackStatus(); }} aria-label="Menu"><span></span><span></span><span></span></button>
           <span className="logo">Rhino<span className="accent">Bot</span></span>
           <span className="tagline">ENT reference, grounded in the standard texts</span>
           <span className="corpus-note">Cummings · Scott-Brown · Stell &amp; Maran · Shambaugh</span>
@@ -701,7 +782,18 @@
                         {moreLoading === i ? "Fetching…" : "⚠ Beyond textbooks"}
                       </button>
                     )}
+                    {m.paywall && payState[i] !== "success" && (
+                      <button className="upgrade-btn" disabled={payState[i] === "loading"} onClick={() => startUpgrade(i)}>
+                        {payState[i] === "loading" ? "Opening…" : "Upgrade — ₹199 / 30 days"}
+                      </button>
+                    )}
                   </div>
+                )}
+                {m.paywall && payState[i] === "success" && (
+                  <div className="pay-success">✓ Pack activated — you have 30 days of access. Ask your question again.</div>
+                )}
+                {m.paywall && payState[i] === "error" && (
+                  <div className="pay-error">Payment didn't go through. Try again, or email support.artai@gmail.com.</div>
                 )}
               </div>
             </div>
@@ -763,6 +855,24 @@
           <div className="acct-body">
             {!histView ? (
               <React.Fragment>
+                {packStatus && !packStatus.active && payState["panel"] !== "success" && (
+                  <div className="panel-upgrade">
+                    <button className="panel-upgrade-btn" disabled={payState["panel"] === "loading"} onClick={() => startUpgrade("panel")}>
+                      {payState["panel"] === "loading" ? "Opening…" : "Upgrade — ₹199 / 30 days"}
+                    </button>
+                    {payState["panel"] === "error" && (
+                      <div className="panel-pay-error">Payment didn't go through. Try again, or email support.artai@gmail.com.</div>
+                    )}
+                  </div>
+                )}
+                {payState["panel"] === "success" && (
+                  <div className="panel-pay-success">✓ Pack activated — 30 days of access unlocked.</div>
+                )}
+                {packStatus && packStatus.active && !packStatus.unlimited && payState["panel"] !== "success" && (
+                  <div className="panel-pack-note">
+                    Pack active{packStatus.expires_at ? " until " + new Date(packStatus.expires_at).toLocaleDateString(undefined,{day:"numeric",month:"short"}) : ""}
+                  </div>
+                )}
                 <button className="acct-btn" onClick={openHistory}><span className="ic">◷</span> Chat history</button>
                 <button className="acct-btn" onClick={() => { setMessages([]); setAcctOpen(false); }}><span className="ic">＋</span> New chat</button>
               </React.Fragment>

@@ -360,6 +360,26 @@ def verify_payment(body: VerifyPaymentIn, request: Request):
     return {"ok": True, "expires_at": expires.isoformat()}
 
 
+@app.get("/pack_status")
+def pack_status(request: Request):
+    """
+    Tell the frontend whether this user currently has an active pack, so the
+    persistent upgrade button in the account panel knows whether to show
+    itself. Fails OPEN (active=False, i.e. show the button) on any DB error --
+    a DB blip should not hide a real conversion opportunity from a free user.
+    """
+    user = verify_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"active": False})
+    email = getattr(user, "email", None)
+    if email and email.lower() in UNLIMITED:
+        return {"active": True, "expires_at": None, "unlimited": True}
+    pack = get_active_pack(email) if email else None
+    if pack:
+        return {"active": True, "expires_at": pack["expires_at"], "unlimited": False}
+    return {"active": False, "expires_at": None, "unlimited": False}
+
+
 @app.get("/worth_read")
 def worth_read(request: Request):
     """
@@ -439,12 +459,12 @@ def chat(body: ChatIn, request: Request):
         if pack:
             used_in_pack = count_user_queries_since(user_email, pack["purchased_at"])
             if used_in_pack is not None and used_in_pack >= PACK_QUERY_LIMIT:
-                return {"answer": _FAIR_USE_MESSAGE, "citations": [], "grounded": False}
+                return {"answer": _FAIR_USE_MESSAGE, "citations": [], "grounded": False, "paywall": True}
             # else: active pack, under the safety cap -> allowed, skip free-15 check
         else:
             used = count_user_queries(user_email)
             if used is not None and used >= FREE_LIMIT:
-                return {"answer": _BLOCK_MESSAGE, "citations": [], "grounded": False}
+                return {"answer": _BLOCK_MESSAGE, "citations": [], "grounded": False, "paywall": True}
 
     msg = (body.message or "").strip()
     if not msg:
