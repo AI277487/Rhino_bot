@@ -39,7 +39,7 @@ _lock = threading.Lock()
 # emails in UNLIMITED bypass the cap entirely. Compared lowercased because
 # Google can return mixed-case emails.
 FREE_LIMIT = 15
-UNLIMITED = {"arpitr1809@gmail.com", "artiirajpoot@gmail.com"}
+UNLIMITED = {"arpitr1809@gmail.com"}
 
 # Emails hidden from the public "recently asked" feed only (NOT the cap bypass).
 # Only the owner's own testing account is hidden; Arti stays visible so the feed
@@ -492,3 +492,35 @@ def pwa_asset(fname: str):
         if os.path.exists(path):
             return FileResponse(path, media_type=_PWA_FILES[fname])
     return JSONResponse(status_code=404, content={"error": "not found"})
+
+
+# --- Internal API for the MCP server (shared-secret; bypasses Supabase login) ---
+_INTERNAL_KEY = os.environ.get("INTERNAL_API_KEY", "").strip()
+
+def _check_internal(request):
+    return bool(_INTERNAL_KEY) and request.headers.get("x-internal-key", "") == _INTERNAL_KEY
+
+@app.post("/internal/chat")
+def internal_chat(body: ChatIn, request: Request):
+    if not _check_internal(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    msg = (body.message or "").strip()
+    if not msg:
+        return {"answer": "Please enter a question.", "citations": [], "grounded": False}
+    with _lock:
+        query.reset_usage()
+        reply, citations, grounded, resolved_q = query.answer(msg, user_id="mcp")
+        query.pop_usage()
+    return {"answer": reply, "citations": citations, "grounded": grounded, "resolved": resolved_q}
+
+@app.post("/internal/search")
+def internal_search(body: ChatIn, request: Request):
+    if not _check_internal(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    msg = (body.message or "").strip()
+    with _lock:
+        sources = query.detect_books(msg)
+        hits = query.retrieve_filtered(msg, keep=6, sources=sources)
+    return {"passages": [{"source": h["meta"].get("source"),
+                          "page": h["meta"].get("page"),
+                          "text": h["doc"]} for h in hits]}
