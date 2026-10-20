@@ -1,15 +1,22 @@
 import os
 import chromadb
-import anthropic
 import json
 import re
+import anthropic
+from openai import OpenAI
+from openai import OpenAI
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
+# One OpenAI-compatible client pointed at DeepSeek. Serves BOTH the planner
+# (V4 Pro) and the generator (V4 Flash) — the model is chosen per-call.
+deepseek_client = OpenAI(
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    base_url="https://api.deepseek.com",
+)
 anthropic_client = anthropic.Anthropic()
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 client = chromadb.PersistentClient(path=os.path.join(_HERE, "chroma_db"))
 
@@ -42,20 +49,26 @@ _bm25 = BM25Okapi([_tok(d) for d in _ALL_DOCS])
 print(f"[BM25 ready: {len(_ALL_IDS)} chunks indexed]")
 _histories = {}
 
-HAIKU  = "claude-haiku-4-5"
-SONNET = "claude-sonnet-5"              # fallback model for general-knowledge answers
-PLANNER = SONNET                       # Sonnet plans retrieval (decompose + reformulate)
+V4_PRO   = "deepseek-v4-pro"      # planner + general-knowledge fallback
+SONNET   = "claude-sonnet-5"      # writes the grounded answer (Anthropic)
+PLANNER   = V4_PRO                # DeepSeek plans retrieval (decompose + reformulate)
+FALLBACK  = V4_PRO                # DeepSeek answers from general knowledge when corpus is silent
+GENERATOR = SONNET                # Anthropic Sonnet writes the citation-grounded answer
 # =============================================================================
 # TOKEN ACCOUNTING
-# Per-request accumulator. Every messages.create call appends via _track();
-# app.py calls reset_usage() before a request and pop_usage() after. The whole
-# pipeline is serialized under app.py's _lock, so this module-global only ever
-# holds one request's calls at a time. Captures ALL calls a request makes —
-# planner + generator, plus a fallback (and a wasted Haiku call on escalation).
+# Per-request accumulator. Every model call appends via _track(); app.py calls
+# reset_usage() before a request and pop_usage() after. The whole pipeline is
+# serialized under app.py's _lock, so this module-global only ever holds one
+# request's calls at a time. Captures ALL calls a request makes — planner +
+# generator, plus a fallback (and a wasted generator call on escalation).
 # =============================================================================
-PRICING = {   # USD per 1,000,000 tokens: {input, output}. Verified 2026-08-20.
-    "claude-haiku-4-5":  {"in": 1.00, "out": 5.00},
-    "claude-sonnet-5":   {"in": 2.00, "out": 10.00},   # may rise to 3/15 on Sep 1
+PRICING = {   # USD per 1,000,000 tokens: {input, output}.
+    # !!! PLACEHOLDER RATES — replace with the real peak prices from
+    # https://api-docs.deepseek.com/quick_start/pricing before trusting cost_usd.
+    # DeepSeek moved to peak/off-peak pricing on 2026-08-16 (off-peak = half),
+    # which this flat table does NOT model — cost_usd will be wrong at off-peak.
+    "deepseek-v4-pro":   {"in": 0.55, "out": 2.19},
+    "claude-sonnet-5":   {"in": 2.00, "out": 10.00},   # generator (Anthropic); may be 3/15
 }
 _USAGE = []
 
@@ -71,15 +84,29 @@ def _rate_for(model):
 
 
 def _track(resp, model):
-    """Record token usage + cost for one messages.create call."""
+    """Record token usage + cost for one model call. Handles the Anthropic usage
+    shape (input_tokens/output_tokens + cache fields) AND the OpenAI shape that
+    DeepSeek returns (prompt_tokens/completion_tokens + prompt_cache_hit_tokens)."""
     u = getattr(resp, "usage", None)
-    inp = getattr(u, "input_tokens", 0) or 0
-    out = getattr(u, "output_tokens", 0) or 0
-    cr  = getattr(u, "cache_read_input_tokens", 0) or 0
-    cw  = getattr(u, "cache_creation_input_tokens", 0) or 0
+    if getattr(u, "input_tokens", None) is not None:
+        # Anthropic shape: input_tokens already EXCLUDES cached tokens
+        inp = getattr(u, "input_tokens", 0) or 0
+        out = getattr(u, "output_tokens", 0) or 0
+        cr  = getattr(u, "cache_read_input_tokens", 0) or 0
+        cw  = getattr(u, "cache_creation_input_tokens", 0) or 0
+    else:
+        # DeepSeek (OpenAI shape): prompt_tokens INCLUDES cache hits, so split
+        # them out. DeepSeek's disk cache has no separate write charge.
+        prompt = getattr(u, "prompt_tokens", 0) or 0
+        cr  = getattr(u, "prompt_cache_hit_tokens", 0) or 0
+        inp = prompt - cr
+        out = getattr(u, "completion_tokens", 0) or 0
+        cw  = 0
     rate = _rate_for(model)
     if rate:
         per_in, per_out = rate["in"] / 1_000_000, rate["out"] / 1_000_000
+        # cache-hit tokens billed at ~0.10x input (approximate — verify on the
+        # pricing page); cw kept for the Anthropic branch only.
         cost = inp * per_in + out * per_out + cr * per_in * 0.10 + cw * per_in * 1.25
     else:
         cost = 0.0
@@ -192,78 +219,85 @@ def detect_books(question):
 
 
 # =============================================================================
-# SONNET QUERY PLANNER  (Sonnet plans retrieval, Haiku writes the answer)
+# QUERY PLANNER  (V4 Pro plans retrieval, V4 Flash writes the answer)
 # Two kinds of decomposition, each gated:
 #   - TOPIC   (multi-entity "X vs Y")            -> split by entity
 #   - FACET   (single broad UNSCOPED entity "X") -> optionally split by clinical
 #             facet (diagnosis/management/complications) ONLY if the user did
 #             not already pick a facet
 #   - NEITHER (already focused: "treatment of X", "complications of FESS") -> one search
-# Sonnet reformulates into textbook terminology but must NOT inject specific
+# The planner reformulates into textbook terminology but must NOT inject specific
 # drugs/facts/sub-topics the user didn't ask about — it rephrases the question,
 # it does not pre-answer it. That preserves the "books decide, not the model"
-# guarantee the citations rest on. Book selection is NOT Sonnet's job — that is
-# handled deterministically by detect_books().
+# guarantee the citations rest on. Book selection is NOT the planner's job — that
+# is handled deterministically by detect_books().
+#
+# NOTE (DeepSeek): tool schema is OpenAI format — {"type":"function","function":
+# {...,"parameters":<json schema>}}. `strict` is DeepSeek BETA and not fully
+# guaranteed, so the Python guards in plan_query remain the real safety net.
 # =============================================================================
 PLAN_TOOL = {
-    "name": "search_plan",
-    "strict": True,
-    "description": (
-        "Plan how to answer the user's ENT question. Return (1) the standalone "
-        "question the assistant should ANSWER, with any follow-up references "
-        "resolved from the conversation, and (2) the search sub-queries used to "
-        "RETRIEVE textbook chunks."
-    ),
-    "input_schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "standalone_question": {
-                "type": "string",
-                "description": (
-                    "The complete, self-contained question the assistant should "
-                    "answer, phrased as a real question a person would ask. "
-                    "Resolve follow-up references from the conversation: "
-                    "'give more complications' after a FESS question becomes "
-                    "'What are the complications of FESS not already covered "
-                    "above?'. This is what the ANSWERING model reads — it must "
-                    "be a full question, NOT a search fragment or keyword list."
-                ),
+    "type": "function",
+    "function": {
+        "name": "search_plan",
+        "strict": True,
+        "description": (
+            "Plan how to answer the user's ENT question. Return (1) the standalone "
+            "question the assistant should ANSWER, with any follow-up references "
+            "resolved from the conversation, and (2) the search sub-queries used to "
+            "RETRIEVE textbook chunks."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "standalone_question": {
+                    "type": "string",
+                    "description": (
+                        "The complete, self-contained question the assistant should "
+                        "answer, phrased as a real question a person would ask. "
+                        "Resolve follow-up references from the conversation: "
+                        "'give more complications' after a FESS question becomes "
+                        "'What are the complications of FESS not already covered "
+                        "above?'. This is what the ANSWERING model reads — it must "
+                        "be a full question, NOT a search fragment or keyword list."
+                    ),
+                },
+                "sub_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "1-4 self-contained search strings in formal textbook "
+                        "terminology (these can be terse). Prefer FEWER, higher-"
+                        "quality sub-queries — do not manufacture a marginal extra "
+                        "facet just to add one. Return ONE for a focused "
+                        "question. For a BROAD question (complications / types / "
+                        "causes / features / management of something, or a bare "
+                        "entity name), break it into the natural sub-topics a "
+                        "textbook covers as separate sections — one query per "
+                        "sub-topic — so each lands in its own part of the corpus. "
+                        "For a MULTI-TOPIC question (comparison / two asks), one "
+                        "query per topic. Expand acronyms; use textbook vocabulary. "
+                        "For a 'give more' follow-up, target the sub-topics NOT "
+                        "already covered in the previous answer."
+                    ),
+                },
+                "in_scope": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether the question is answerable within ENT "
+                        "(otorhinolaryngology / head & neck, audiology and directly "
+                        "related topics). Interpret ambiguous questions in the ENT "
+                        "frame and set true — 'what antibiotics are used' means in "
+                        "ENT, 'NICE guidelines' means the ENT-relevant ones. Set "
+                        "FALSE only when the question is clearly a non-ENT medical "
+                        "field with no reasonable ENT reading (orthopedic fractures, "
+                        "cardiac conditions, obstetrics). When in doubt, true."
+                    ),
+                },
             },
-            "sub_queries": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "1-4 self-contained search strings in formal textbook "
-                    "terminology (these can be terse). Prefer FEWER, higher-"
-                    "quality sub-queries — do not manufacture a marginal extra "
-                    "facet just to add one. Return ONE for a focused "
-                    "question. For a BROAD question (complications / types / "
-                    "causes / features / management of something, or a bare "
-                    "entity name), break it into the natural sub-topics a "
-                    "textbook covers as separate sections — one query per "
-                    "sub-topic — so each lands in its own part of the corpus. "
-                    "For a MULTI-TOPIC question (comparison / two asks), one "
-                    "query per topic. Expand acronyms; use textbook vocabulary. "
-                    "For a 'give more' follow-up, target the sub-topics NOT "
-                    "already covered in the previous answer."
-                ),
-            },
-            "in_scope": {
-                "type": "boolean",
-                "description": (
-                    "Whether the question is answerable within ENT "
-                    "(otorhinolaryngology / head & neck, audiology and directly "
-                    "related topics). Interpret ambiguous questions in the ENT "
-                    "frame and set true — 'what antibiotics are used' means in "
-                    "ENT, 'NICE guidelines' means the ENT-relevant ones. Set "
-                    "FALSE only when the question is clearly a non-ENT medical "
-                    "field with no reasonable ENT reading (orthopedic fractures, "
-                    "cardiac conditions, obstetrics). When in doubt, true."
-                ),
-            },
+            "required": ["standalone_question", "sub_queries", "in_scope"],
         },
-        "required": ["standalone_question", "sub_queries", "in_scope"],
     },
 }
 
@@ -294,9 +328,12 @@ PLANNER_SYSTEM = (
     "intracranial and CSF leak complications of endoscopic sinus surgery; local "
     "complications of endoscopic sinus surgery (synechiae, nasolacrimal injury, "
     "anosmia).\n"
-    "Prefer FEWER, well-chosen sub-topics (typically 3-4 max). Do not invent a "
-    "thin extra facet just to pad the list — a marginal sub-query pulls weak "
-    "chunks that can crowd out strong ones.\n"
+    "Prefer FEWER, well-chosen sub-topics (typically 3-4 max). Do not invent "
+    "a thin extra facet just to pad the list — a marginal sub-query pulls weak "
+    "chunks that can crowd out strong ones. BUT a BROAD question (complications " 
+    "/ types / causes / features / management of X) must NEVER return a single "
+    "sub-query — it requires at least 3 sub-topic searches. A one-query plan is "
+    "only valid for a FOCUSED question.\n"
     "- 'GIVE MORE' follow-up -> target the sub-topics NOT already covered in the "
     "previous answer shown in the conversation.\n\n"
     "Reformulate each sub-query for RETRIEVAL, which matches literal words:\n"
@@ -323,9 +360,9 @@ PLANNER_SYSTEM = (
 )
 
 def plan_query(question, history=None):
-    """Ask Sonnet for a search plan. Returns (standalone_question, sub_queries).
+    """Ask V4 Pro for a search plan. Returns (standalone_question, sub_queries, in_scope).
     standalone_question is what generation answers; sub_queries drive retrieval.
-    Falls back to (question, [question]) if anything goes wrong."""
+    Falls back to (question, [question], True) if anything goes wrong."""
     if history:
         recent = "\n".join(history[-6:])   # include prior answer so 'more' works
         content = (f"Conversation so far:\n{recent}\n\n"
@@ -333,20 +370,28 @@ def plan_query(question, history=None):
     else:
         content = question
     try:
-        msg = anthropic_client.messages.create(
+        msg = deepseek_client.chat.completions.create(
             model=PLANNER,
-            max_tokens=1024,
-            thinking={"type": "disabled"},
-            system=PLANNER_SYSTEM,
+            max_tokens=2000,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": PLANNER_SYSTEM},
+                {"role": "user", "content": content},
+            ],
             tools=[PLAN_TOOL],
-            tool_choice={"type": "tool", "name": "search_plan"},
-            messages=[{"role": "user", "content": content}],
+            tool_choice={"type": "function", "function": {"name": "search_plan"}},
+            extra_body={"thinking": {"type": "disabled"}},   # OFF: fast, no reasoning_content
         )
         _track(msg, PLANNER)
-        plan = next((b.input for b in msg.content
-                     if getattr(b, "type", None) == "tool_use"), None)
-        if not plan:
+
+        tool_calls = msg.choices[0].message.tool_calls
+        if not tool_calls:
             return question, [question], True
+        args = tool_calls[0].function.arguments
+        plan = json.loads(args) if isinstance(args, str) else args
+        if not isinstance(plan, dict):
+            return question, [question], True
+
         standalone = (plan.get("standalone_question") or question).strip()
 
         # scope flag: default True when absent/None so a missing field never refuses
@@ -354,9 +399,9 @@ def plan_query(question, history=None):
         in_scope = True if raw_scope is None else bool(raw_scope)
 
         raw_subs = plan.get("sub_queries")
-        # schema is NOT strictly enforced: a malformed/truncated tool call can
-        # return sub_queries as a STRING, which iterates into characters and
-        # explodes retrieval. Wrap a string into a single-item list.
+        # schema is NOT strictly enforced (DeepSeek strict is beta): a malformed/
+        # truncated tool call can return sub_queries as a STRING, which iterates
+        # into characters and explodes retrieval. Wrap a string into a single-item list.
         if isinstance(raw_subs, str):
             raw_subs = [raw_subs]
         if not isinstance(raw_subs, list):
@@ -377,15 +422,14 @@ def plan_query(question, history=None):
 
 def extract_text(msg):
     """
-    Return the assistant's text from a response. Some models (e.g. Sonnet with
-    extended thinking) put a ThinkingBlock first, so content[0] may NOT be text.
-    Join all blocks that actually have a .text attribute.
+    (Unused after the DeepSeek swap — kept for reference.) Return assistant text
+    from an Anthropic-shaped response by joining all blocks that have .text.
     """
     parts = [b.text for b in msg.content if getattr(b, "type", None) == "text"]
     return "".join(parts).strip()
 
-# Exact phrase we instruct Haiku to emit when the corpus can't answer.
-# Detecting it is how we decide to escalate to Sonnet.
+# Exact phrase we instruct the generator to emit when the corpus can't answer.
+# Detecting it is how we decide to escalate to the fallback model.
 NO_INFO_MARKER = "The provided sources do not address this"
 
 
@@ -439,20 +483,31 @@ def collapse_dup_cells(text):
     return "\n".join(l for l in out if l.strip()).strip()
 
 
+_TABLE_PART_RE = re.compile(r"^(.*)_c(\d+)$")
+
+
+def _natural_key(cid):
+    """Reading order for chunk ids: _b2 before _b10, _c0 before _c1."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", cid)]
+
+
 def build_citations(answer_text, picked):
     """
-    Turn the [book, p.N] markers Haiku wrote into the citation objects the
-    frontend needs: {id, book, page, chunk_text}. One entry per distinct
-    (book, page) actually cited, in order of first appearance, backed by the
-    highest-ranked retrieved chunk for that page. Markers with no matching
-    retrieved chunk are skipped (the chip still renders via the frontend's
-    {book,page} fallback, just without a source passage).
+    Turn the [book, p.N] markers into citation objects for the frontend.
+    One entry per distinct (book, page) cited, in order of first appearance.
+    For each page:
+      - every retrieved PROSE chunk is included (reading order)
+      - each TABLE contributes ONE chunk only (prefer c0, which carries the
+        table caption/number) — the table body is already rendered in the
+        answer, so its other fragments are not repeated in the drawer.
+    `passages` is the list the drawer renders; `chunk_text` is the same
+    content joined, kept for older saved answers / code paths.
     """
     by_key = {}
-    for rec in picked:  # picked is already rrf-sorted, so first = best
+    for rec in picked:
         m = rec["meta"]
         key = (str(m.get("source", "")).lower(), str(m.get("page", "")))
-        by_key.setdefault(key, rec)
+        by_key.setdefault(key, []).append(rec)
 
     seen, cites = set(), []
     for mo in CITE_RE.finditer(answer_text):
@@ -461,17 +516,31 @@ def build_citations(answer_text, picked):
         if key in seen:
             continue
         seen.add(key)
-        rec = by_key.get(key)
-        if not rec:
+        recs = by_key.get(key)
+        if not recs:
             continue
+
+        recs = sorted(recs, key=lambda r: _natural_key(r["id"]))
+        kept, tables_seen = [], set()
+        for r in recs:                                   # reading order => c0 comes first
+            if r["meta"].get("type") == "table":
+                m = _TABLE_PART_RE.match(r["id"])
+                table_key = m.group(1) if m else r["id"]
+                if table_key in tables_seen:
+                    continue                             # one chunk per table
+                tables_seen.add(table_key)
+            kept.append(r)
+
+        passages = [collapse_dup_cells(r["doc"]) for r in kept]
         cites.append({
-            "id": rec["id"],
+            "id": kept[0]["id"],
+            "ids": [r["id"] for r in kept],
             "book": book,
             "page": int(page),
-            "chunk_text": collapse_dup_cells(rec["doc"]),
+            "passages": passages,
+            "chunk_text": "\n\n".join(passages),
         })
     return cites
-
 
 OUT_OF_SCOPE_MARKER = "OUT_OF_SCOPE"
 OUT_OF_SCOPE_REPLY = (
@@ -498,20 +567,24 @@ FALLBACK_SYSTEM = (
 )
 
 
-def sonnet_fallback(question):
+def fallback_answer(question):
     """
-    Corpus was silent -> answer from Sonnet's own knowledge, but ONLY within ENT
+    Corpus was silent -> answer from V4 Pro's own knowledge, but ONLY within ENT
     scope, and clearly flagged as NOT from the textbook sources. Out-of-ENT
     questions are refused rather than answered.
     """
-    msg = anthropic_client.messages.create(
-        model=SONNET,
+    msg = deepseek_client.chat.completions.create(
+        model=FALLBACK,
         max_tokens=1500,
-        system=FALLBACK_SYSTEM,
-        messages=[{"role": "user", "content": question}],
+        temperature=0,
+        messages=[
+            {"role": "system", "content": FALLBACK_SYSTEM},
+            {"role": "user", "content": question},
+        ],
+        extra_body={"thinking": {"type": "disabled"}},   # enable if you want deeper answers
     )
-    _track(msg, SONNET)
-    body = extract_text(msg)
+    _track(msg, FALLBACK)
+    body = (msg.choices[0].message.content or "").strip()
 
     if OUT_OF_SCOPE_MARKER in body:
         return OUT_OF_SCOPE_REPLY
@@ -605,9 +678,9 @@ def answer(query, user_id="default"):
     if books:
         print(f"[book filter: user named {books}]")
 
-    # 2. Sonnet plans in ONE call: resolves the follow-up into a standalone
-    #    question (what Haiku answers) AND decomposes into retrieval sub-queries.
-    #    This replaces both contextualize() and decompose().
+    # 2. V4 Pro plans in ONE call: resolves the follow-up into a standalone
+    #    question (what the generator answers) AND decomposes into retrieval
+    #    sub-queries. This replaces both contextualize() and decompose().
     search_query, subqueries, in_scope = plan_query(query, history)
     if not in_scope:
         reply = OUT_OF_SCOPE_REPLY
@@ -685,8 +758,8 @@ def answer(query, user_id="default"):
     print(f"[context: {len(docs)} chunks, {len(context)} chars]")
     print(f"[sources: {[(m.get('source'), m.get('page')) for m in metas]}]")
     if not docs:
-        print("[empty context -> Sonnet fallback]")
-        reply = sonnet_fallback(search_query)
+        print("[empty context -> fallback]")
+        reply = fallback_answer(search_query)
         history.append(f"User: {query}")
         history.append(f"Assistant: {reply}")
         if len(history) > 20:
@@ -711,7 +784,7 @@ sentence and nothing else:
 "{NO_INFO_MARKER}."
 
 When you answer:
-- Cite the document name and page for each claim. Cite each source in its own
+- Cite the document name and page for each claim and do not miss any citation. Cite each source in its own
   bracket, with one book and one page per bracket:
     [cummings, p.3431] [shaumbaugh, p.1042]   correct
   Never combine two sources in one bracket, and never use a page range. Write
@@ -719,12 +792,11 @@ When you answer:
     [cummings, p.3431; shaumbaugh, p.1042]    wrong  (two sources grouped)
     [shaumbaugh, p.742-743]                   wrong  (page range)
 - Be concise but complete; do not drop information.
-- If the question asks how two conditions DIFFER (X vs Y), lead with the
-  concrete point-by-point contrast — the specific distinguishing features a
-  clinician uses at the bedside (e.g. discharge character, perforation site,
-  examination findings, complication risk). Put any "these overlap / the
-  classification is nuanced" caveat LAST, not first. Do not answer a contrast
-  question with a general classification lecture.
+- If the question asks how two conditions DIFFER (X vs Y), lead with the concrete point-by-point
+  contrast — the specific distinguishing features a clinician uses at the bedside 
+  (e.g. discharge character, perforation site, examination findings, complication risk). 
+  Put any "these overlap / the classification is nuanced" caveat LAST, not first. Do not 
+  answer a contrast question with a general classification lecture.
 - If an excerpt contains a pipe-formatted table, REPRODUCE it as a markdown
   table: keep the pipes, and include the |---| header-separator row so it
   renders as a grid. Preserve the column meaning; do not invent columns.
@@ -736,24 +808,24 @@ Context:
 Question: {search_query}"""
 
     message = anthropic_client.messages.create(
-        model=HAIKU,
-        max_tokens=2000,
+        model=GENERATOR,
+        max_tokens=2500,
         messages=[{"role": "user", "content": prompt}],
     )
-    _track(message, HAIKU)
+    _track(message, GENERATOR)
     reply = extract_text(message)
 
-    # 3. escalate to Sonnet ONLY when Haiku actually refused. The reliable signal
-    #    is the marker appearing at the START of the reply (Haiku leads with it when
-    #    it has nothing). A marker buried mid-answer means it gave real content, so
-    #    we keep the RAG answer.
+    # 3. escalate to the fallback model ONLY when the generator actually refused.
+    #    The reliable signal is the marker appearing at the START of the reply
+    #    (the generator leads with it when it has nothing). A marker buried
+    #    mid-answer means it gave real content, so we keep the RAG answer.
     stripped = reply.strip()
     core = stripped.lstrip('"# ').strip()
     is_refusal = (core.lower().startswith(NO_INFO_MARKER.lower())
                   or (NO_INFO_MARKER.lower() in stripped.lower() and len(stripped) < 350))
     if is_refusal:
-        print("[no info in sources -> escalating to Sonnet]")
-        reply = sonnet_fallback(search_query)
+        print("[no info in sources -> escalating to fallback]")
+        reply = fallback_answer(search_query)
         citations = []                    # fallback has no grounded citations
         grounded = False
     else:
@@ -774,8 +846,12 @@ if __name__ == "__main__":
         que = input("\nAsk (or 'quit'): ")
         if que.lower() == "quit":
             break
+        reset_usage()  # ← NEW: clear the accumulator
         text, cites, grounded, resolved = answer(que)
+        usage = pop_usage()  # ← NEW: drain + capture the totals
         print("\n" + text)
         print("resolved:", resolved)
         print("grounded:", grounded)
         print("citations:", [(c["book"], c["page"]) for c in cites])
+        print(f"cost: ${usage['cost_usd']:.4f}  ({usage['total_tokens']} tok)")  # ← NEW
+        print("by model:", usage["cost_breakdown"])  # ← NEW
